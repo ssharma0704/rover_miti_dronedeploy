@@ -10,6 +10,7 @@ Ubuntu 22.04 jammy, ROS 2 Humble).
 |---|---|
 | `setup_rover_miti_dronedeploy.sh` | Provisions **the machine it runs on**. |
 | `provision_rover_remote.sh` | Provisions **other machines over SSH**. Use for a fleet. |
+| [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Failure modes indexed by error text, all seen on real hardware. |
 
 ---
 
