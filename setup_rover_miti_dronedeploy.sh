@@ -586,6 +586,16 @@ if ! grep -Fq "$ROS_SOURCE_LINE" "$RUN_HOME/.bashrc" 2>/dev/null; then
     print_green "  added ROS sourcing to ~/.bashrc"
 fi
 
+# The services below pin RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Without the
+# same pin in .bashrc an interactive shell falls back to Humble's FastDDS
+# default and silently sees none of the topics the services publish -- the
+# failure looks like "the camera node isn't running" rather than a mismatch.
+RMW_LINE="export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+if ! grep -Fq "$RMW_LINE" "$RUN_HOME/.bashrc" 2>/dev/null; then
+    echo "$RMW_LINE" >> "$RUN_HOME/.bashrc"
+    print_green "  pinned RMW_IMPLEMENTATION=rmw_cyclonedds_cpp in ~/.bashrc"
+fi
+
 #########################################################################
 step "ROS 2 $ROS_DISTRO_SEL packages"
 #########################################################################
@@ -672,8 +682,52 @@ done
 # Wait for device to re-enumerate
 sleep 3
 
-sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2 dbitrate 2000000 dsjw 15 berr-reporting on fd on
-sudo ip link set up $CAN_IFACE
+if ! ip link show $CAN_IFACE >/dev/null 2>&1; then
+  echo "enablecan: $CAN_IFACE does not exist -- USB-CAN adapter not connected?" >&2
+  exit 1
+fi
+
+# The bitrate cannot be changed while the interface is up.
+sudo ip link set down $CAN_IFACE 2>/dev/null
+
+# The CANable/gs_usb adapters used on these rovers support neither CAN-FD nor
+# berr-reporting, and 'ip' rejects the whole command with "RTNETLINK answers:
+# Operation not supported" if any one option is unsupported. The bitrate still
+# lands, because the kernel commits the bit-timing attribute before it reaches
+# the unsupported ctrlmode -- but relying on that ordering means the script
+# cannot tell a configured bus from a broken one. Degrade one capability at a
+# time instead, so better adapters still get the richer config.
+if sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2 \\
+        dbitrate 2000000 dsjw 15 berr-reporting on fd on 2>/dev/null; then
+  echo "enablecan: $CAN_IFACE configured with CAN-FD (500000/2000000)"
+elif sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2 berr-reporting on 2>/dev/null; then
+  echo "enablecan: $CAN_IFACE configured as classic CAN (500000) with berr-reporting"
+elif sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2; then
+  echo "enablecan: $CAN_IFACE configured as classic CAN (500000), no FD or berr-reporting"
+else
+  echo "enablecan: failed to configure $CAN_IFACE" >&2
+  exit 1
+fi
+
+sudo ip link set up $CAN_IFACE || {
+  echo "enablecan: failed to bring up $CAN_IFACE" >&2; exit 1; }
+
+# Verify rather than assume. Without this the unit reports "active" whenever
+# the last command happened to exit 0, so can.service's Restart=on-failure
+# would never fire on a silently misconfigured bus.
+#
+# Note this checks the LINK is up, not that the bus is healthy. A bus with no
+# other node powered still comes UP and then sits in ERROR-PASSIVE; use
+# 'candump $CAN_IFACE' and 'ip -details link show $CAN_IFACE' to check that.
+for _ in \$(seq 10); do
+  if [ "\$(ip -brief link show $CAN_IFACE 2>/dev/null | awk '{print \$2}')" = "UP" ]; then
+    echo "enablecan: $CAN_IFACE is UP"
+    exit 0
+  fi
+  sleep 0.5
+done
+echo "enablecan: $CAN_IFACE did not come UP" >&2
+exit 1
 EOF_ENABLECAN
 sudo chmod +x /usr/sbin/enablecan
 print_green "  wrote /usr/sbin/enablecan"
@@ -683,10 +737,11 @@ sudo tee /etc/systemd/system/can.service >/dev/null <<'EOF_CANSVC'
 Description=Bring up CAN interface
 After=network.target
 Wants=network.target
-# Cap the retries. On modern systemd these two keys belong in [Unit], not
-# [Service], or they are ignored with an "Unknown key name" warning.
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# Retry forever rather than giving up: a finite cap left the unit permanently
+# dead once the burst was spent ("Start request repeated too quickly"), so an
+# adapter plugged in later was never picked up. Safe *because* RestartSec
+# below provides the backoff. On modern systemd this key belongs in [Unit].
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -696,8 +751,7 @@ TimeoutStartSec=45
 Restart=on-failure
 # Without an explicit RestartSec, systemd retries every ~100ms. With the
 # USB-CAN adapter unplugged this becomes a restart storm (observed >2600
-# restarts in minutes), burning CPU and flooding the journal. Back off instead;
-# plug the adapter in and 'systemctl start can.service' (or reboot) to bring up.
+# restarts in minutes), burning CPU and flooding the journal.
 RestartSec=10
 
 [Install]
@@ -705,8 +759,52 @@ WantedBy=multi-user.target
 EOF_CANSVC
 print_green "  wrote /etc/systemd/system/can.service"
 
+# --- can-watchdog ------------------------------------------------------
+# can.service is Type=oneshot + RemainAfterExit, so systemd reports it active
+# forever once the link is up and Restart= can never fire again -- an adapter
+# knocked loose mid-mission would go unnoticed. Poll the link instead.
+sudo tee /usr/sbin/can-watchdog >/dev/null <<EOF_CANWD
+#!/bin/bash
+IFACE=$CAN_IFACE
+state=\$(ip -brief link show "\$IFACE" 2>/dev/null | awk '{print \$2}')
+[ "\$state" = "UP" ] && exit 0
+echo "can-watchdog: \$IFACE is \${state:-missing}; restarting can.service"
+systemctl restart can.service
+EOF_CANWD
+sudo chmod +x /usr/sbin/can-watchdog
+
+sudo tee /etc/systemd/system/can-watchdog.service >/dev/null <<'EOF_CANWDSVC'
+[Unit]
+Description=Restart can.service if the CAN link has dropped
+After=can.service
+# Deliberately not Requires=/Wants=can.service: this must still run when
+# can.service is failed, which is exactly when it is needed.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/can-watchdog
+EOF_CANWDSVC
+
+sudo tee /etc/systemd/system/can-watchdog.timer >/dev/null <<'EOF_CANWDTMR'
+[Unit]
+Description=Periodically verify the CAN link is up
+
+[Timer]
+# Give can.service a chance to bring the link up at boot before checking.
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+Unit=can-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF_CANWDTMR
+print_green "  wrote can-watchdog.service + .timer"
+
 sudo systemctl daemon-reload
 sudo systemctl enable can.service >/dev/null 2>&1 || warn "Could not enable can.service"
+sudo systemctl enable --now can-watchdog.timer >/dev/null 2>&1 || \
+    warn "Could not enable can-watchdog.timer"
 
 if sudo systemctl restart can.service; then
     sleep 2
@@ -780,6 +878,19 @@ if [ "$DO_REALSENSE" = true ]; then
                     libuvc_installation.sh
             fi
 
+            # Intel's script prompts "Remove all RealSense cameras attached"
+            # whenever /dev/video* exists, and it runs under 'bash -xe'. An
+            # unattended run has stdin on /dev/null, so 'read' returns EOF
+            # non-zero and -e kills the build in seconds -- a plugged-in camera
+            # is what breaks it. Neutralize the prompt: with FORCE_LIBUVC the
+            # build never touches the kernel uvc driver, so a connected camera
+            # is harmless (replug afterwards to pick up the new udev rules).
+            sed -i 's|^\([[:space:]]*\)read -p .*|\1true|' libuvc_installation.sh
+            if grep -q '^[[:space:]]*read ' libuvc_installation.sh; then
+                warn "libuvc_installation.sh still has an interactive prompt after patching;
+       upstream may have changed. The build will likely abort on EOF."
+            fi
+
             chmod +x ./libuvc_installation.sh
             print_italic "  building librealsense (this can take ~45 minutes)..."
             if ./libuvc_installation.sh; then
@@ -843,6 +954,10 @@ EOF_RSRESET
 Description=Intel RealSense Camera ROS2 Node
 Wants=network-online.target
 After=network-online.target
+# Restart forever. systemd's default limit is 5 starts per 10s, which
+# RestartSec=5 below stays clear of -- but only just, and tripping it would
+# leave the camera permanently down until someone intervened. Disable it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -860,7 +975,9 @@ ExecStart=/usr/bin/env bash -lc '\\
   ros2 run web_video_server web_video_server & \\
   wait'
 Restart=always
-RestartSec=2
+# Every restart re-runs the ExecStartPre USB reset, so keep some distance
+# between attempts when the camera is missing or wedged.
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
@@ -941,19 +1058,26 @@ EOF_RRSCRIPT
 Description=Rover Robotics $ROBOT_TYPE driver
 After=can.service network.target
 Wants=can.service
-# Same reasoning as can.service: without a cap this retries forever when the
-# CAN bus is absent. Give up after 10 tries in 5 minutes instead of filling
-# the journal until someone notices.
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# Same reasoning as can.service: retry forever, and rely on RestartSec below
+# for the backoff rather than a cap. A cap means that a rover booted before
+# its CAN bus is ready stays dead until a human intervenes -- the opposite of
+# what an unattended deployment needs.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=$RUN_USER
 Environment=HOME=$RUN_HOME
+# Must match rover-realsense.service and the ~/.bashrc pin. systemd units do
+# not read .bashrc, so every unit needs its own copy. Mixing RMW
+# implementations is unsupported in ROS 2: the driver and the camera node
+# would each come up fine yet never see each other's topics.
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ExecStart=/bin/bash /usr/sbin/roverrobotics
-Restart=on-failure
-RestartSec=3
+# 'always', not 'on-failure': a driver that exits 0 has still stopped driving
+# the robot, so treat a clean exit as something to recover from too.
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
