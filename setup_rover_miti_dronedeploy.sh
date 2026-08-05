@@ -1032,8 +1032,12 @@ ExecStart=/usr/bin/env bash -lc '\\
   ros2 launch realsense2_camera rs_launch.py & \\
   sleep 5; \\
   ros2 run web_video_server web_video_server & \\
-  wait'
+  wait -n'
 Restart=always
+# 'wait -n', not 'wait'. Bare wait blocks until *all* children exit, so if the
+# camera node died while web_video_server kept running, the unit stayed
+# "active", Restart=always never fired, and the camera was down until someone
+# noticed. -n returns on the first child to exit, so systemd restarts the pair.
 # Every restart re-runs the ExecStartPre USB reset, so keep some distance
 # between attempts when the camera is missing or wedged.
 RestartSec=5
