@@ -81,7 +81,9 @@ re-provision of an already-configured machine takes about 30 seconds.
 -c, --can    <iface>          CAN interface                   (default: can2)
 -o, --owner  <github-user>    Owner of the private repos      (default: ssharma0704)
     --bootstrap-auth          One-time per-machine GitHub key setup
--y, --yes                     Non-interactive
+-y, --yes                     Non-interactive: take each prompt's default
+    --reboot                  Reboot at the end on success (gs_usb, udev rules
+                              and the dialout group need it)
     --skip-realsense          Skip RealSense entirely
     --skip-librealsense       Skip only the ~45 min SDK build
     --no-build                Skip the final colcon build
