@@ -196,6 +196,38 @@ wait_for_apt() {
     return 0
 }
 
+# Wait for a RealSense camera to appear on USB.
+#
+# Polled rather than a blocking "press Enter", so an attended run and a -y run
+# behave identically: both give the operator a window to plug the camera in, and
+# neither hangs forever if nobody is there. Absence is a warning, never fatal --
+# a headless provision with the camera fitted later is legitimate.
+REALSENSE_USB_RE='8086:0b|realsense'
+wait_for_realsense() {
+    local waited=0 max="${REALSENSE_WAIT_SECS:-120}" found=""
+    command -v lsusb >/dev/null 2>&1 || { print_italic "  lsusb unavailable; skipping camera check"; return 0; }
+
+    while :; do
+        found="$(lsusb 2>/dev/null | grep -Ei "$REALSENSE_USB_RE" | head -1 || true)"
+        [ -n "$found" ] && break
+        if [ "$waited" -eq 0 ]; then
+            print_yellow "  Plug the RealSense camera in now."
+            print_italic  "  (the SDK build wanted it unplugged; a replug is also what picks up"
+            print_italic  "   the new udev rules). Waiting up to ${max}s..."
+        fi
+        sleep 5; waited=$((waited + 5))
+        if [ "$waited" -ge "$max" ]; then
+            warn "No RealSense camera detected after ${max}s. Continuing anyway.
+       Plug it in, then:  sudo systemctl restart rover-realsense.service"
+            return 1
+        fi
+    done
+
+    [ "$waited" -gt 0 ] && print_green "  camera appeared after ${waited}s"
+    print_green "  RealSense camera detected: ${found#*ID }"
+    return 0
+}
+
 # Run apt-get, waiting out lock contention and retrying once.
 apt_get() {
     wait_for_apt
@@ -1015,6 +1047,16 @@ EOF_RSSVC
     sudo systemctl daemon-reload
     sudo systemctl enable rover-realsense.service >/dev/null 2>&1 || \
         warn "Could not enable rover-realsense.service"
+
+    # The SDK build asks for the camera to be unplugged, and nothing ever asked
+    # for it back -- so a run could finish "successfully" with no camera
+    # attached and rover-realsense.service starting against nothing. A replug is
+    # wanted here anyway, to pick up the udev rules written below. Poll rather
+    # than block on a keypress, so this behaves the same attended or under -y.
+    # '|| true' matters: the script runs under 'set -e' and the not-found path
+    # returns 1, which would otherwise abort the run on the very case this is
+    # meant to survive.
+    wait_for_realsense || true
 else
     print_italic "  RealSense skipped (--skip-realsense)"
 fi
