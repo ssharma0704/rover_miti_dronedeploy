@@ -51,6 +51,7 @@ ROS_PACKAGE_SET="desktop"
 DO_ROS_INSTALL=true
 DO_BOOTSTRAP_AUTH=false
 ASSUME_YES=false
+DO_REBOOT=false
 DO_REALSENSE=true
 DO_LIBREALSENSE_BUILD=true
 DO_JETPACK=true
@@ -84,7 +85,11 @@ Options:
                                 deploy key, and wire up git. Needs GITHUB_TOKEN
                                 or an authenticated gh CLI. Run this on each new
                                 computer; afterwards the machine pulls on its own.
-  -y, --yes                     Non-interactive, assume yes
+  -y, --yes                     Non-interactive: take each prompt's default
+      --reboot                  Reboot at the end on success. gs_usb, the udev
+                                rules and the dialout group only take effect
+                                after a reboot, so a hands-off provision wants
+                                this. Skipped if the colcon build failed.
       --skip-realsense          Skip RealSense entirely (SDK + ROS wrapper + service)
       --skip-librealsense       Clone realsense-ros but do NOT rebuild the
                                 librealsense SDK (~45 min build)
@@ -115,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --skip-ros-install) DO_ROS_INSTALL=false; shift ;;
         --bootstrap-auth)   DO_BOOTSTRAP_AUTH=true; shift ;;
         -y|--yes)    ASSUME_YES=true; shift ;;
+        --reboot)    DO_REBOOT=true; shift ;;
         --skip-realsense)    DO_REALSENSE=false; shift ;;
         --skip-librealsense) DO_LIBREALSENSE_BUILD=false; shift ;;
         --skip-jetpack)      DO_JETPACK=false; shift ;;
@@ -157,7 +163,13 @@ die() { echo ""; print_red "FATAL: ${1}"; exit 1; }
 confirm() {
     # confirm "question" default(yes|no) -> returns 0 for yes
     local q="$1" def="${2:-yes}" yn
-    if [ "$ASSUME_YES" = true ]; then return 0; fi
+    # Under -y take each prompt's OWN default rather than answering yes to
+    # everything. "Rebuild librealsense (~45 min)?" defaults to no precisely
+    # because it is already installed; answering yes there burned 45 minutes on
+    # every re-run of an otherwise idempotent script.
+    if [ "$ASSUME_YES" = true ]; then
+        if [ "$def" = "no" ]; then return 1; else return 0; fi
+    fi
     if [ "$def" = "no" ]; then
         read -rp "$q [y/N]: " yn; yn="${yn:-n}"
     else
@@ -453,6 +465,21 @@ if ! sudo -n true 2>/dev/null; then
     die "This script needs sudo, but sudo is not usable non-interactively here.
        Run it from a terminal, or grant NOPASSWD sudo for the duration of the run."
 fi
+
+# Priming sudo once is not enough: sudo's timestamp_timeout is 15 min by
+# default, and the librealsense build alone runs ~45 min without invoking sudo.
+# The first sudo call after that build would then re-prompt for a password and
+# stall an otherwise unattended run. Refresh the timestamp in the background for
+# the life of the script.
+sudo_keepalive() {
+    while true; do
+        sudo -n true 2>/dev/null || return 0
+        sleep 60
+    done
+}
+sudo_keepalive &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
 
 #########################################################################
 step "System package index + base utilities"
@@ -1158,5 +1185,15 @@ print_bold "====================================================="
 
 if [ "$DO_BUILD" = true ] && [ "$BUILD_OK" != true ]; then
     exit 1
+fi
+
+# Deliberately last, and deliberately opt-in: over SSH this drops the
+# connection, and rebooting a machine nobody asked to reboot is a bad default.
+# Never reached when the build failed -- the exit above sees to that, so a
+# broken provision stays up for inspection instead of rebooting into it.
+if [ "$DO_REBOOT" = true ]; then
+    print_bold "Rebooting now (--reboot) so gs_usb, udev rules and the dialout group take effect."
+    sync
+    sudo shutdown -r +1 "rover provisioning complete; rebooting" || sudo reboot
 fi
 exit 0
