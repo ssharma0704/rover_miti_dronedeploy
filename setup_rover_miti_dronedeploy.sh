@@ -32,7 +32,7 @@ WORKSPACE_DIR="$HOME/$WORKSPACE_NAME"
 
 ROS_DISTRO_DEFAULT="humble"
 ROBOT_TYPE_DEFAULT="miti"
-CAN_IFACE_DEFAULT="can2"
+CAN_IFACE_DEFAULT="rovercan"
 
 # Runtime user the systemd services run as. Defaults to whoever invoked the
 # script (via sudo or not) rather than a hardcoded name, so the units work on
@@ -70,7 +70,8 @@ Usage: ./setup_rover_miti_dronedeploy.sh [options]
 Options:
   -d, --distro <humble|jazzy>   ROS 2 distro                (default: humble)
   -r, --robot  <miti|miti_65>   Robot variant               (default: miti)
-  -c, --can    <iface>          CAN interface name          (default: can2)
+  -c, --can    <iface>          CAN interface name, bound by udev to the
+                                adapter's USB VID:PID    (default: rovercan)
   -o, --owner  <github-user>    GitHub owner of the private repos
                                                             (default: ssharma0704)
       --rover-branch <branch>   Branch of roverrobotics_ros2 to clone
@@ -722,32 +723,127 @@ step "CAN service ($CAN_IFACE)"
 #########################################################################
 # /usr/sbin/enablecan  -- resets the USB-CAN adapter to recover from a stale
 # state after a hot reboot, then brings up the CAN-FD interface.
-sudo tee /usr/sbin/enablecan >/dev/null <<EOF_ENABLECAN
-#!/bin/bash
+# udev rule first: the kernel canN name is not stable on the AGX Orin (the
+# onboard mttcan controllers and the USB adapter race for can0/can1/can2 at
+# boot), so bind the adapter to a fixed name by USB VID:PID.
+sudo tee /etc/udev/rules.d/60-rover-can.rules >/dev/null <<EOF_CANUDEV
+# Give the USB-CAN adapter a stable name.
+#
+# The kernel name is NOT stable. On the AGX Orin the two onboard mttcan
+# controllers and this USB adapter race for can0/can1/can2 at boot: the same
+# adapter came up as can2 on one boot and can0 on the next. Anything that
+# hardcodes a canN name will, on some boots, bind to an onboard controller with
+# nothing wired to it -- the bus reads as completely dead, the driver logs
+# "Did not receive any data from the robot", and it looks exactly like a flaky
+# or failed CAN bus.
+#
+# Bind by USB VID:PID instead, so the name follows the adapter.
+# 1d50:606f = OpenMoko / Geschwister Schneider CAN adapter (CANable, gs_usb).
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", NAME="$CAN_IFACE"
+EOF_CANUDEV
+sudo udevadm control --reload-rules >/dev/null 2>&1 || true
+print_green "  wrote /etc/udev/rules.d/60-rover-can.rules ($CAN_IFACE)"
 
-# Reset USB-CAN adapter to recover from stale state after hot reboot
-for dev in /sys/bus/usb/devices/*/product; do
-  if grep -qi "canable\\|gs_usb" "\$dev" 2>/dev/null; then
-    usb_path=\$(dirname "\$dev")
-    auth_file="\${usb_path}/authorized"
-    if [[ -w "\$auth_file" ]]; then
-      echo 0 > "\$auth_file"
-      sleep 2
-      echo 1 > "\$auth_file"
+# Rename the adapter now, without waiting for a reboot. A device cannot be
+# renamed while it is up.
+for _i in $(ip -brief link show type can 2>/dev/null | awk '{print $1}'); do
+    _drv=$(basename "$(readlink -f "/sys/class/net/$_i/device/driver" 2>/dev/null)" 2>/dev/null)
+    if [ "$_drv" = "gs_usb" ] && [ "$_i" != "$CAN_IFACE" ]; then
+        sudo ip link set down "$_i" 2>/dev/null
+        sudo udevadm trigger --action=add --subsystem-match=net 2>/dev/null
+        sleep 2
+        print_green "  renamed $_i -> $CAN_IFACE"
     fi
-  fi
 done
 
-# Wait for device to re-enumerate
+sudo tee /usr/sbin/enablecan >/dev/null <<'EOF_ENABLECAN'
+#!/bin/bash
+# Bring up the rover's USB-CAN adapter.
+#
+# IFACE is the udev-assigned stable name from
+# /etc/udev/rules.d/60-rover-can.rules -- deliberately NOT a kernel canN name.
+# The kernel name is not stable: on the AGX Orin the onboard mttcan controllers
+# and the USB adapter race for can0/can1/can2 at boot, so the same adapter was
+# can2 on one boot and can0 on the next. Pointing at a kernel name silently
+# binds to an onboard controller with nothing attached, and the bus reads dead.
+IFACE=rovercan
+BITRATE=500000
+DBITRATE=2000000
+
+# Root under systemd; fall back to sudo when a human runs this by hand. Calling
+# sudo unconditionally breaks non-interactive shells that have no tty and no
+# NOPASSWD rule -- it prompts, fails, and the script reports a bus fault that
+# is really just a sudo fault.
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+
+# Reset the USB-CAN adapter to recover from stale state after a hot reboot, and
+# because gs_usb will not re-open after 'ip link set down' without a USB-level
+# reset -- 'ip link set up' then fails with "RTNETLINK answers: No such device"
+# and no amount of retrying at the netlink layer helps.
+#
+# Match on USB VID:PID, NOT the product string. The previous version grepped
+# product for "canable|gs_usb"; the adapter actually fitted to these rovers
+# reports "USB2CAN V3.3", so the reset silently never ran and the recovery path
+# was dead. Same 1d50:606f used by the udev rule.
+VID=1d50
+PID=606f
+reset_done=0
+for devdir in /sys/bus/usb/devices/*; do
+  [ -r "$devdir/idVendor" ] && [ -r "$devdir/idProduct" ] || continue
+  [ "$(cat "$devdir/idVendor")" = "$VID" ] || continue
+  [ "$(cat "$devdir/idProduct")" = "$PID" ] || continue
+  auth_file="$devdir/authorized"
+  [ -w "$auth_file" ] || continue
+  echo "enablecan: resetting USB adapter at $(basename "$devdir") ($VID:$PID)"
+  echo 0 > "$auth_file"
+  sleep 2
+  echo 1 > "$auth_file"
+  reset_done=1
+done
+
+if [ "$reset_done" -eq 0 ]; then
+  echo "enablecan: no $VID:$PID adapter found on the USB bus to reset" >&2
+fi
+
+# Settle BEFORE polling, then poll.
+#
+# The sleep is not optional and must come first. After the re-authorize above
+# the old netdev is still being torn down, so an immediate 'ip link show' can
+# succeed against the dying interface. Configuring that one appears to work and
+# then the follow-up 'ip link set up' fails with "RTNETLINK answers: No such
+# device", because by then it has been replaced. Polling alone reproduced this
+# on every single attempt.
+#
+# The poll then covers the opposite case -- a slow boot where enumeration plus
+# the udev rename takes longer than the settle.
 sleep 3
 
-if ! ip link show $CAN_IFACE >/dev/null 2>&1; then
-  echo "enablecan: $CAN_IFACE does not exist -- USB-CAN adapter not connected?" >&2
+for _ in $(seq 20); do
+  ip link show "$IFACE" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+
+if ! ip link show "$IFACE" >/dev/null 2>&1; then
+  echo "enablecan: $IFACE did not appear within 10s." >&2
+  echo "           Either the USB-CAN adapter is not connected, or" >&2
+  echo "           /etc/udev/rules.d/60-rover-can.rules is missing." >&2
+  echo "           Present CAN interfaces: $(ip -brief link show type can 2>/dev/null | awk '{print $1}' | tr '\n' ' ')" >&2
   exit 1
 fi
 
-# The bitrate cannot be changed while the interface is up.
-sudo ip link set down $CAN_IFACE 2>/dev/null
+# Confirm we are talking to the USB adapter and not an onboard controller.
+# This is the failure that cost us a day: an mttcan interface with nothing
+# wired to it comes up UP and ERROR-ACTIVE and looks perfectly healthy, but
+# carries no data. Warn rather than fail -- a different adapter model is
+# legitimate, an onboard controller almost never is.
+drv=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
+if [ "$drv" = "mttcan" ]; then
+  echo "enablecan: WARNING: $IFACE is an onboard mttcan controller, not the USB" >&2
+  echo "           adapter. Unless something is wired to it, this bus will be" >&2
+  echo "           silent. Check /etc/udev/rules.d/60-rover-can.rules." >&2
+elif [ -n "$drv" ] && [ "$drv" != "gs_usb" ]; then
+  echo "enablecan: note: $IFACE is driven by '$drv', not gs_usb."
+fi
 
 # The CANable/gs_usb adapters used on these rovers support neither CAN-FD nor
 # berr-reporting, and 'ip' rejects the whole command with "RTNETLINK answers:
@@ -756,20 +852,46 @@ sudo ip link set down $CAN_IFACE 2>/dev/null
 # the unsupported ctrlmode -- but relying on that ordering means the script
 # cannot tell a configured bus from a broken one. Degrade one capability at a
 # time instead, so better adapters still get the richer config.
-if sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2 \\
-        dbitrate 2000000 dsjw 15 berr-reporting on fd on 2>/dev/null; then
-  echo "enablecan: $CAN_IFACE configured with CAN-FD (500000/2000000)"
-elif sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2 berr-reporting on 2>/dev/null; then
-  echo "enablecan: $CAN_IFACE configured as classic CAN (500000) with berr-reporting"
-elif sudo ip link set $CAN_IFACE type can bitrate 500000 sjw 2; then
-  echo "enablecan: $CAN_IFACE configured as classic CAN (500000), no FD or berr-reporting"
-else
-  echo "enablecan: failed to configure $CAN_IFACE" >&2
+#
+# Note: if tier 1 succeeds you are probably NOT on the USB adapter. The onboard
+# mttcan controllers do support CAN-FD; gs_usb does not.
+configure_and_up() {
+  # The bitrate cannot be changed while the interface is up.
+  $SUDO ip link set down "$IFACE" 2>/dev/null
+
+  local mode
+  if $SUDO ip link set "$IFACE" type can bitrate "$BITRATE" sjw 2 \
+          dbitrate "$DBITRATE" dsjw 15 berr-reporting on fd on 2>/dev/null; then
+    mode="CAN-FD ($BITRATE/$DBITRATE)"
+  elif $SUDO ip link set "$IFACE" type can bitrate "$BITRATE" sjw 2 berr-reporting on 2>/dev/null; then
+    mode="classic CAN ($BITRATE) with berr-reporting"
+  elif $SUDO ip link set "$IFACE" type can bitrate "$BITRATE" sjw 2 2>/dev/null; then
+    mode="classic CAN ($BITRATE), no FD or berr-reporting"
+  else
+    return 1
+  fi
+
+  $SUDO ip link set up "$IFACE" 2>/dev/null || return 1
+
+  echo "enablecan: $IFACE configured as $mode"
+  return 0
+}
+
+# Retry the whole configure+up as a unit. Doing it piecemeal is what hid the
+# race above: a configure that succeeds against an interface which is replaced
+# before the 'up' leaves the bus down while every individual command looked
+# fine.
+ok=0
+for attempt in 1 2 3; do
+  if configure_and_up; then ok=1; break; fi
+  echo "enablecan: attempt $attempt to configure $IFACE failed; retrying in 2s" >&2
+  sleep 2
+done
+
+if [ "$ok" -ne 1 ]; then
+  echo "enablecan: failed to configure and bring up $IFACE after 3 attempts" >&2
   exit 1
 fi
-
-sudo ip link set up $CAN_IFACE || {
-  echo "enablecan: failed to bring up $CAN_IFACE" >&2; exit 1; }
 
 # Verify rather than assume. Without this the unit reports "active" whenever
 # the last command happened to exit 0, so can.service's Restart=on-failure
@@ -777,17 +899,19 @@ sudo ip link set up $CAN_IFACE || {
 #
 # Note this checks the LINK is up, not that the bus is healthy. A bus with no
 # other node powered still comes UP and then sits in ERROR-PASSIVE; use
-# 'candump $CAN_IFACE' and 'ip -details link show $CAN_IFACE' to check that.
-for _ in \$(seq 10); do
-  if [ "\$(ip -brief link show $CAN_IFACE 2>/dev/null | awk '{print \$2}')" = "UP" ]; then
-    echo "enablecan: $CAN_IFACE is UP"
+# 'candump rovercan' and 'ip -details link show rovercan' to check for that.
+for _ in $(seq 10); do
+  if [ "$(ip -brief link show "$IFACE" 2>/dev/null | awk '{print $2}')" = "UP" ]; then
+    echo "enablecan: $IFACE is UP"
     exit 0
   fi
   sleep 0.5
 done
-echo "enablecan: $CAN_IFACE did not come UP" >&2
+echo "enablecan: $IFACE did not come UP" >&2
 exit 1
 EOF_ENABLECAN
+# The script ships with IFACE=rovercan; honour --can if it was overridden.
+sudo sed -i "s|^IFACE=rovercan$|IFACE=$CAN_IFACE|" /usr/sbin/enablecan
 sudo chmod +x /usr/sbin/enablecan
 print_green "  wrote /usr/sbin/enablecan"
 
@@ -822,14 +946,39 @@ print_green "  wrote /etc/systemd/system/can.service"
 # can.service is Type=oneshot + RemainAfterExit, so systemd reports it active
 # forever once the link is up and Restart= can never fire again -- an adapter
 # knocked loose mid-mission would go unnoticed. Poll the link instead.
-sudo tee /usr/sbin/can-watchdog >/dev/null <<EOF_CANWD
+sudo tee /usr/sbin/can-watchdog >/dev/null <<'EOF_CANWD'
 #!/bin/bash
-IFACE=$CAN_IFACE
-state=\$(ip -brief link show "\$IFACE" 2>/dev/null | awk '{print \$2}')
-[ "\$state" = "UP" ] && exit 0
-echo "can-watchdog: \$IFACE is \${state:-missing}; restarting can.service"
+# can.service is Type=oneshot + RemainAfterExit=true, so once enablecan
+# succeeds systemd reports it active forever -- including after the USB-CAN
+# adapter is knocked loose or the link is otherwise brought down. Restart=
+# cannot help there, because no process ever exits to trigger it. Poll the
+# actual link state instead and restart the unit whenever it is not UP.
+#
+# IFACE is the udev-assigned stable name, not a kernel canN name -- see
+# /etc/udev/rules.d/60-rover-can.rules.
+#
+# Run from can-watchdog.timer every 30s.
+IFACE=rovercan
+
+state=$(ip -brief link show "$IFACE" 2>/dev/null | awk '{print $2}')
+
+if [ "$state" = "UP" ]; then
+    exit 0
+fi
+
+# Say whether the adapter is even plugged in. Without this the journal just
+# shows a restart every 30s with no indication whether the cable is out or the
+# link merely dropped.
+if lsusb 2>/dev/null | grep -qi "1d50:606f"; then
+    detail="adapter present on USB"
+else
+    detail="adapter NOT present on USB -- check the cable"
+fi
+
+echo "can-watchdog: $IFACE is ${state:-missing} ($detail); restarting can.service"
 systemctl restart can.service
 EOF_CANWD
+sudo sed -i "s|^IFACE=rovercan$|IFACE=$CAN_IFACE|" /usr/sbin/can-watchdog
 sudo chmod +x /usr/sbin/can-watchdog
 
 sudo tee /etc/systemd/system/can-watchdog.service >/dev/null <<'EOF_CANWDSVC'
@@ -1034,10 +1183,9 @@ ExecStart=/usr/bin/env bash -lc '\\
   ros2 run web_video_server web_video_server & \\
   wait -n'
 Restart=always
-# 'wait -n', not 'wait'. Bare wait blocks until *all* children exit, so if the
-# camera node died while web_video_server kept running, the unit stayed
-# "active", Restart=always never fired, and the camera was down until someone
-# noticed. -n returns on the first child to exit, so systemd restarts the pair.
+# 'wait -n', not 'wait': bare wait blocks until *all* children exit, so a
+# dead camera node with web_video_server still running left the unit
+# "active", Restart=always never fired, and the camera stayed down.
 # Every restart re-runs the ExecStartPre USB reset, so keep some distance
 # between attempts when the camera is missing or wedged.
 RestartSec=5
@@ -1119,9 +1267,28 @@ step "Autostart service (roverrobotics.service)"
 if [ "$DO_AUTOSTART" = true ]; then
     sudo tee /usr/sbin/roverrobotics >/dev/null <<EOF_RRSCRIPT
 #!/bin/bash
-source /opt/ros/$ROS_DISTRO_SEL/setup.bash
-source $WORKSPACE_DIR/install/setup.bash
-ros2 launch roverrobotics_driver ${ROBOT_TYPE}_teleop.launch.py
+# Launcher for roverrobotics.service. Kept as a script rather than inlined into
+# ExecStart so both 'source' steps run in the same shell as ros2 launch.
+
+ROS_SETUP=/opt/ros/$ROS_DISTRO_SEL/setup.bash
+WS_SETUP=$WORKSPACE_DIR/install/setup.bash
+
+for f in "\$ROS_SETUP" "\$WS_SETUP"; do
+  if [ ! -f "\$f" ]; then
+    echo "roverrobotics: \$f not found -- workspace not built?" >&2
+    exit 1
+  fi
+done
+
+# No 'set -u': the ROS setup scripts reference unset variables internally and
+# would abort the launch. No 'set -e' either -- 'source' of the ROS setup can
+# return non-zero harmlessly on some distros.
+source "\$ROS_SETUP"
+source "\$WS_SETUP"
+
+# exec so systemd supervises ros2 launch directly instead of a wrapper shell:
+# signals reach the launch process, and MAINPID is the thing that matters.
+exec ros2 launch roverrobotics_driver ${ROBOT_TYPE}_teleop.launch.py
 EOF_RRSCRIPT
     sudo chmod +x /usr/sbin/roverrobotics
     print_green "  wrote /usr/sbin/roverrobotics ($ROBOT_TYPE)"
@@ -1161,6 +1328,28 @@ EOF_RRSVC
         warn "Could not enable roverrobotics.service"
 else
     print_italic "  autostart skipped (--skip-autostart)"
+fi
+
+#########################################################################
+step "Driver CAN interface config"
+#########################################################################
+# The fork already ships device_port: "rovercan", matching CAN_IFACE_DEFAULT and
+# the udev rule, so the normal path needs no edit and the clone stays clean and
+# tracking the fork. Only patch when --can overrode the name -- otherwise the
+# udev rule, enablecan and can-watchdog would all agree on a name the driver
+# does not use, and the driver would bind to the wrong interface with no error.
+RR_CONFIG="$WORKSPACE_DIR/src/$ROVER_REPO_NAME/roverrobotics_driver/config/${ROBOT_TYPE}_config.yaml"
+if [ -f "$RR_CONFIG" ]; then
+    CURRENT_PORT=$(grep -oP 'device_port:\s*"\K[^"]+' "$RR_CONFIG" 2>/dev/null || true)
+    if [ -n "$CURRENT_PORT" ] && [ "$CURRENT_PORT" != "$CAN_IFACE" ]; then
+        sudo sed -i "s|device_port: \"$CURRENT_PORT\"|device_port: \"$CAN_IFACE\"|" "$RR_CONFIG"
+        warn "Patched $(basename "$RR_CONFIG"): device_port $CURRENT_PORT -> $CAN_IFACE"
+        warn "  This leaves the repo clone dirty. Commit it or drop --can to avoid that."
+    else
+        print_green "  ${ROBOT_TYPE}_config.yaml already targets $CAN_IFACE"
+    fi
+else
+    warn "Could not find $RR_CONFIG -- check device_port matches $CAN_IFACE by hand"
 fi
 
 #########################################################################
