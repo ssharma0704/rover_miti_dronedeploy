@@ -59,7 +59,10 @@ Reattach any time with `--follow`.
    `cv_bridge`, `image_transport`, `pluginlib`, `rclcpp_components`, ffmpeg dev
    libs (`libav*`, `libswscale`), `libx264-dev`, OpenCV, Boost
 8. `gs_usb` kernel module via `/etc/modules-load.d/gs_usb.conf`
-9. **`can.service`** + `/usr/sbin/enablecan` (USB-CAN reset, CAN-FD bring-up)
+9. **`60-rover-can.rules`** — udev rule binding the USB-CAN adapter to a stable
+   name by VID:PID, plus **`can.service`** + `/usr/sbin/enablecan` (USB reset,
+   CAN-FD → classic fallback, link verification) and **`can-watchdog`** +
+   timer, which restores the link if it drops
 10. Clones `roverrobotics_ros2`, `web_video_server` (private), and `bno055`
 11. **RealSense** — librealsense SDK with CUDA, `realsense-ros`,
     `reset_realsense_usb.sh`, `rover-realsense.service`
@@ -68,8 +71,42 @@ Reattach any time with `--follow`.
 14. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`)
 15. `colcon build`
 
-Everything is **idempotent** — a re-run skips what's already installed. A full
-re-provision of an already-configured machine takes about 30 seconds.
+Everything is **idempotent** — a re-run skips what's already installed.
+
+---
+
+## How long it takes
+
+Every run writes `=== PROVISION START <ISO8601> ===` and
+`=== PROVISION END <ISO8601> EXIT_CODE=<n> ===` to the log, so the wall clock for
+any run is two `grep`s away:
+
+```bash
+grep -E 'PROVISION (START|END)' provision.log
+```
+
+Measured on a Jetson AGX Orin Developer Kit (JetPack 6, ROS 2 Humble already
+installed):
+
+| Run | Wall clock | Notes |
+|---|---|---|
+| Full, librealsense built from source | **30 min** | step 11 alone is ~27 min of it |
+| `--skip-librealsense`, SDK already present | **~2 min** | the normal re-provision |
+| `-y --skip-realsense` | **~3 min** | everything except the camera |
+
+Where the time actually goes:
+
+- **librealsense CUDA build: ~27 min.** Everything else together is a rounding
+  error next to it. `--skip-librealsense` is the single biggest lever.
+- `colcon build`, 9 packages: **~1 min**
+- apt, `gs_usb`, CAN service, udev, repos, rosdep, services: **~2 min** combined
+
+**Not yet measured: a genuinely bare machine.** Every run above had ROS 2,
+JetPack and CUDA already present — steps 2–5 were no-ops. Expect a clean image to
+add roughly **25–50 min** for ROS 2 desktop + JetPack + CUDA, dominated by
+download speed, but treat that as an estimate rather than a number from a log.
+**When you next provision a fresh Jetson, grab the START/END pair and replace
+this paragraph with the real figure.**
 
 ---
 
@@ -78,7 +115,8 @@ re-provision of an already-configured machine takes about 30 seconds.
 ```
 -d, --distro <humble|jazzy>   ROS 2 distro                    (default: humble)
 -r, --robot  <miti|miti_65>   Robot variant                   (default: miti)
--c, --can    <iface>          CAN interface                   (default: can2)
+-c, --can    <iface>          CAN interface, udev-bound to the
+                              adapter VID:PID              (default: rovercan)
 -o, --owner  <github-user>    Owner of the private repos      (default: ssharma0704)
     --bootstrap-auth          One-time per-machine GitHub key setup
 -y, --yes                     Non-interactive: take each prompt's default
@@ -112,14 +150,31 @@ Revoke a machine any time from **Repo → Settings → Deploy keys**.
 
 Behaviour worth knowing about, most of it learned by running this on real hardware:
 
-- **`can2`, not `can0`.** The Jetson AGX Orin's two *native* CAN controllers take
-  `can0`/`can1`, so the USB-CAN adapter enumerates as `can2`. That matches
-  `miti_config.yaml`. Override with `--can`.
+- **`rovercan`, not any `canN`.** The kernel name is *not stable* on the AGX
+  Orin: the two native `mttcan` controllers and the USB adapter race for
+  `can0`/`can1`/`can2` at boot and the winner changes between boots. The same
+  adapter was `can2` for several boots and then came up as `can0`, at which
+  point everything hardcoding `can2` configured an onboard controller with
+  nothing wired to it — link `UP` and `ERROR-ACTIVE`, `candump` silent, driver
+  fataling with "Did not receive any data from the robot", and no log anywhere
+  naming the cause. A udev rule binds the adapter by USB VID:PID
+  (`1d50:606f`) to a fixed name instead, matching `miti_config.yaml`. Override
+  with `--can`, which also patches the driver config to match.
+- **`gs_usb` will not re-open after `ip link set down`** — `ip link set up` then
+  returns `ENODEV` despite a valid ifindex. That is why `enablecan` toggles the
+  adapter's sysfs `authorized` flag first; it matches on VID:PID, not the USB
+  product string, because these adapters report `USB2CAN V3.3`. With the old
+  product-string match the reset never ran, so `can-watchdog` could detect a
+  dropped link but never restore it.
 - **CAN restart storm.** The original `can.service` had `Restart=on-failure` with
   no `RestartSec`, so with the adapter unplugged systemd retried every ~100 ms —
-  over 2600 restarts in minutes. This version sets `RestartSec=10` and a start
-  limit. Note `StartLimitIntervalSec`/`StartLimitBurst` belong in `[Unit]`; in
-  `[Service]` modern systemd ignores them.
+  over 2600 restarts in minutes. This version sets `RestartSec=10` for the
+  backoff and `StartLimitIntervalSec=0` to retry *forever* — a finite cap left
+  the unit permanently dead once the burst was spent
+  (`Start request repeated too quickly`), so an adapter plugged in later was
+  never picked up. Unlimited retries are safe precisely because `RestartSec`
+  provides the spacing. Note `StartLimitIntervalSec` belongs in `[Unit]`; in
+  `[Service]` modern systemd ignores it.
 - **RealSense service prerequisites.** `rover-realsense.service` runs
   `sudo -n /usr/local/sbin/reset_realsense_usb.sh`, which needs a NOPASSWD
   sudoers entry, and sets `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, which needs
