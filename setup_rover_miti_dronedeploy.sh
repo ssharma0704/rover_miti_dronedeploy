@@ -406,6 +406,36 @@ detect_auth() {
     print_italic "GitHub auth mode: $AUTH_MODE"
 }
 
+# The URL this machine can actually authenticate with, in preference order.
+#
+# Deploy key first, deliberately: it is the only credential that SURVIVES to
+# the next run. A token clone used to leave a bare https origin behind (the
+# token was stripped for good reason -- see sanitize_origin), and that origin
+# cannot authenticate, so every re-provision died here with
+#   fatal: could not read Username for 'https://github.com'
+# even though --bootstrap-auth had given the machine working deploy keys and
+# the README promised re-runs need no token.
+best_repo_url() {
+    local name="$1" token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if git ls-remote --heads "git@github.com:${GITHUB_OWNER}/${name}.git" >/dev/null 2>&1; then
+        printf 'git@github.com:%s/%s.git' "$GITHUB_OWNER" "$name"
+    elif [ -n "$token" ]; then
+        printf 'https://x-access-token:%s@github.com/%s/%s.git' "$token" "$GITHUB_OWNER" "$name"
+    else
+        printf 'https://github.com/%s/%s.git' "$GITHUB_OWNER" "$name"
+    fi
+}
+
+# Never leave a token sitting in .git/config after the fetch that needed it.
+sanitize_origin() {
+    local dest="$1" name="$2"
+    case "$(git -C "$dest" remote get-url origin 2>/dev/null)" in
+        *x-access-token*)
+            git -C "$dest" remote set-url origin \
+                "https://github.com/${GITHUB_OWNER}/${name}.git" ;;
+    esac
+}
+
 # clone_or_update <repo-name> <branch> <dest-dir>
 clone_or_update() {
     local name="$1" branch="$2" dest="$3"
@@ -413,7 +443,23 @@ clone_or_update() {
 
     if [ -d "$dest/.git" ]; then
         print_italic "  $name already present -> fetching branch '$branch'"
-        git -C "$dest" fetch --all --prune
+        if ! git -C "$dest" fetch --all --prune >/dev/null 2>&1; then
+            # Self-heal rather than abort: re-point origin at whatever this
+            # machine can authenticate with and try once more. A failed fetch
+            # must never take down a whole re-provision -- the workspace is
+            # already present and buildable.
+            git -C "$dest" remote set-url origin "$(best_repo_url "$name")"
+            if git -C "$dest" fetch --all --prune >/dev/null 2>&1; then
+                print_green "  re-pointed origin to a credential this machine holds"
+            else
+                sanitize_origin "$dest" "$name"
+                warn "$name: fetch failed and no usable GitHub credential was found.
+       Left as-is; the existing checkout still builds. Re-run with
+       --bootstrap-auth (or export GITHUB_TOKEN) to refresh it."
+                return 0
+            fi
+        fi
+        sanitize_origin "$dest" "$name"
         # Do not clobber local work: only fast-forward, and say so if we can't.
         if git -C "$dest" merge --ff-only "origin/$branch" >/dev/null 2>&1; then
             print_green "  $name updated to origin/$branch"
@@ -446,9 +492,11 @@ clone_or_update() {
     fi
 
     # A token baked into the clone URL would otherwise persist in .git/config.
-    if [ "$AUTH_MODE" = "token" ]; then
-        git -C "$dest" remote set-url origin \
-            "https://github.com/${GITHUB_OWNER}/${name}.git"
+    # Point origin at the deploy key when one exists, so the NEXT run can fetch
+    # without a token; fall back to plain https only when it can't.
+    if [ "$AUTH_MODE" = "token" ] || [ "$AUTH_MODE" = "gh" ]; then
+        git -C "$dest" remote set-url origin "$(best_repo_url "$name")"
+        sanitize_origin "$dest" "$name"
     fi
     print_green "  cloned $name (branch $branch)"
 }
