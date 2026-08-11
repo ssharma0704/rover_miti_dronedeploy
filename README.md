@@ -52,7 +52,8 @@ Reattach any time with `--follow`.
 1. Base utilities, `apt-utils`
 2. **NVIDIA JetPack** (skipped gracefully on non-Jetson hardware)
 3. **CUDA toolkit** — detected first, installed only if missing
-4. **Firefox**
+4. **Firefox** — the real Mozilla **arm64 deb**, from `packages.mozilla.org`.
+   Not the snap: see the gotcha below, the snap cannot run on a Jetson at all
 5. **ROS 2** (`humble` by default) — installs it if absent, including apt keyring and repo
 6. ROS packages: nav2, slam-toolbox, robot-localization, xacro, joy-linux, …
 7. **Dependencies for the patched `web_video_server`** — `async_web_server_cpp`,
@@ -70,13 +71,16 @@ Reattach any time with `--follow`.
     binds the BNO055's FT232H bridge (`0403:6014`) to `/dev/bno055` so the IMU
     does not depend on `ttyUSB*` enumeration order
 13. `rosdep`
-14. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`), which
+14. **`reset_bno055_usb.sh`** + `/etc/sudoers.d/rover-bno055` — an
+    `ExecStartPre` that flushes the IMU's UART before each driver start, so a
+    restart loop cannot sustain itself on a desynced serial port
+15. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`), which
     also brings up the **BNO055 IMU** when `accessories.yaml` enables it, and
     the **PS5 (DualSense) gamepad** — `miti_teleop.launch.py` includes
     `ps5_controller.launch.py`, which loads `ps5_controller_config_jp6.yaml`
     (the JetPack 6 axis/button map; the non-`_jp6` file has the sticks and
     triggers on the wrong indices for this kernel)
-15. `colcon build`
+16. `colcon build`
 
 Everything is **idempotent** — a re-run skips what's already installed.
 
@@ -97,23 +101,29 @@ installed):
 
 | Run | Wall clock | Notes |
 |---|---|---|
-| Full, librealsense built from source | **30 min** | step 11 alone is ~27 min of it |
+| **Genuinely bare machine, full run** | **48 min** | measured; see breakdown below |
+| Full, librealsense built from source | **30 min** | on a machine that already had ROS 2 |
 | `--skip-librealsense`, SDK already present | **~2 min** | the normal re-provision |
 | `-y --skip-realsense` | **~3 min** | everything except the camera |
 
-Where the time actually goes:
+**The bare-machine number is now measured, not estimated.** A freshly flashed
+AGX Orin (NVMe root, no ROS 2, no CUDA, no Firefox) took **47 min 56 s** end to
+end, exit code 0, 9/9 packages:
 
-- **librealsense CUDA build: ~27 min.** Everything else together is a rounding
-  error next to it. `--skip-librealsense` is the single biggest lever.
-- `colcon build`, 9 packages: **~1 min**
-- apt, `gs_usb`, CAN service, udev, repos, rosdep, services: **~2 min** combined
+| Phase | Wall clock |
+|---|---|
+| Steps 1–10 — base, JetPack, CUDA, Firefox, **full ROS 2 Humble desktop**, repos | **14 min** |
+| Step 11 — librealsense CUDA build | **~15 min** |
+| Step 16 — `colcon build`, 9 packages | **1 min 26 s** |
 
-**Not yet measured: a genuinely bare machine.** Every run above had ROS 2,
-JetPack and CUDA already present — steps 2–5 were no-ops. Expect a clean image to
-add roughly **25–50 min** for ROS 2 desktop + JetPack + CUDA, dominated by
-download speed, but treat that as an estimate rather than a number from a log.
-**When you next provision a fresh Jetson, grab the START/END pair and replace
-this paragraph with the real figure.**
+Two things that breakdown corrects:
+
+- **CUDA is free.** `nvidia-jetpack` in step 2 pulls in CUDA 12.6, so step 3
+  detects it and skips. Budget nothing for it.
+- **The old 25–50 min estimate for a clean image was pessimistic**, and so was
+  the ~27 min figure for librealsense. Download speed dominates, so your own
+  numbers will move with your link — but 48 min is a real figure from a real
+  log, not an extrapolation.
 
 ---
 
@@ -157,6 +167,31 @@ Revoke a machine any time from **Repo → Settings → Deploy keys**.
 
 Behaviour worth knowing about, most of it learned by running this on real hardware:
 
+- **Firefox: never `snap install firefox` on a Jetson.** The L4T Tegra kernel
+  ships **without AppArmor**, which snapd requires, so *every* snap fails with
+  `required permitted capability cap_dac_override not found`. The trap is that
+  `getcap` shows the capability present on `snap-confine` and the rootfs is not
+  `nosuid`, so the binary looks perfectly fine and reinstalling snapd or
+  re-running `setcap` changes nothing. Worse, Ubuntu's arm64 `firefox` apt
+  package is only a ~2.4 kB *transitional shim* to that snap, so
+  `command -v firefox` succeeds while no working browser exists — which is how
+  this silently shipped a dead browser on every machine. The provisioner now
+  installs Mozilla's real arm64 deb and **verifies by running it**. Note the
+  install needs `--allow-downgrades`: Ubuntu's shim carries an epoch
+  (`1:1snap1-0ubuntu2`) that outranks Mozilla's bare version string.
+- **A restart loop can outlive the fault that started it.** `on_exit=Shutdown()`
+  means any required node dying tears the whole launch down — so the journal
+  tail usually shows several dead nodes and **the last one named is not the
+  cause**. Read from the top of one cycle and take the *first* failure, then use
+  the exit code: **−2 is a collateral SIGINT, 1 is the node's own error.**
+  Seen on real hardware: a rover booted with no CAN adapter looped ~150 times,
+  and each teardown killed the `bno055` node mid-transaction, leaving stale
+  bytes in the FT232H. After that, **connecting the CAN adapter did not fix it**
+  — the loop had stopped being about CAN and was sustaining itself on the
+  desynced UART. `reset_bno055_usb.sh` now flushes the port before every start
+  so this cannot persist. Do not power-cycle the bridge on every start instead:
+  that also reboots the sensor, and the node then opens the port before it can
+  answer.
 - **`rovercan`, not any `canN`.** The kernel name is *not stable* on the AGX
   Orin: the two native `mttcan` controllers and the USB adapter race for
   `can0`/`can1`/`can2` at boot and the winner changes between boots. The same
@@ -196,6 +231,21 @@ Behaviour worth knowing about, most of it learned by running this on real hardwa
 - **rosdep warning is expected.** `ros-gz-bridge` / `ros-gz-sim` have no Humble
   arm64 build. They're only needed by `roverrobotics_gazebo`, which builds fine
   regardless and isn't used on the robot.
+- **A dead BNO055 now takes the whole driver down with it.** As of `a91464f` the
+  IMU node carries `on_exit=Shutdown()`, matching the driver node. That is
+  deliberate — without it a dead IMU left `roverrobotics.service` reporting
+  `active` with `NRestarts=0` while `/imu/data` was silent, the same blind spot
+  that once hid the driver crash-loop. The cost is that an IMU fault is no
+  longer survivable: the launch tears down and systemd restarts everything, so a
+  rover with a failed or unplugged IMU **restart-loops instead of driving
+  without an IMU**. If a machine has no BNO055 fitted, set `active: false` under
+  `bno055` in `accessories.yaml` — leaving it `true` with no hardware is a
+  guaranteed restart loop, not a warning.
+- **`/imu/data` is jittery by nature — 32–56 Hz.** Measured across many samples
+  on the reference rover: std dev ~0.03 s with occasional 0.13 s gaps. It is a
+  UART-polled sensor at 115200 baud, not a fixed-rate publisher. Do not read the
+  variation as a fault, and do not write a healthcheck that expects a steady
+  rate.
 
 ---
 
