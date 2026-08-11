@@ -71,7 +71,11 @@ Reattach any time with `--follow`.
     does not depend on `ttyUSB*` enumeration order
 13. `rosdep`
 14. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`), which
-    also brings up the **BNO055 IMU** when `accessories.yaml` enables it
+    also brings up the **BNO055 IMU** when `accessories.yaml` enables it, and
+    the **PS5 (DualSense) gamepad** — `miti_teleop.launch.py` includes
+    `ps5_controller.launch.py`, which loads `ps5_controller_config_jp6.yaml`
+    (the JetPack 6 axis/button map; the non-`_jp6` file has the sticks and
+    triggers on the wrong indices for this kernel)
 15. `colcon build`
 
 Everything is **idempotent** — a re-run skips what's already installed.
