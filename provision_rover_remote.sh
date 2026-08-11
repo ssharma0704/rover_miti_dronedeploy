@@ -63,6 +63,10 @@ Environment:
   GITHUB_TOKEN       Forwarded to the rover for the one-time --bootstrap-auth
                      step, so a brand-new machine can register its own
                      read-only deploy keys and clone the private repos.
+  ROVER_RESET_HOSTKEY=1
+                     Clear a CHANGED SSH host key automatically instead of
+                     stopping. Expected after reflashing a machine that kept
+                     its IP; without this the run aborts with instructions.
 
 Notes:
   * Requires 'sshpass' only when using password auth. SSH keys are preferred:
@@ -101,6 +105,29 @@ USE_SSHPASS=false
 
 setup_transport() {
     local host="$1"
+
+    # A reflashed machine that keeps its IP presents a NEW host key, and every
+    # ssh/scp then aborts before provisioning can even start -- the failure
+    # shows up as an unhelpful "scp: Connection closed / copy failed". Catch it
+    # here and say exactly what to run, instead of letting it look like a
+    # network or credentials problem.
+    local probe
+    probe="$(ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                 "${ROVER_USER}@${host}" true 2>&1 || true)"
+    if printf '%s' "$probe" | grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED"; then
+        if [ "${ROVER_RESET_HOSTKEY:-0}" = "1" ]; then
+            warn "host key for ${host} changed (reflashed?); removing it as ROVER_RESET_HOSTKEY=1"
+            ssh-keygen -R "$host" >/dev/null 2>&1 || true
+        else
+            bad "Host key for ${host} has CHANGED."
+            bad "Expected after reflashing a machine that kept its IP. If that is what happened:"
+            bad "    ssh-keygen -R ${host}"
+            bad "or re-run with ROVER_RESET_HOSTKEY=1 to clear it automatically."
+            bad "If you did NOT reflash it, stop and investigate before continuing."
+            return 1
+        fi
+    fi
+
     # Prefer key auth; fall back to a password only if keys don't work.
     if ssh -o BatchMode=yes "${SSH_OPTS[@]}" "${ROVER_USER}@${host}" true 2>/dev/null; then
         USE_SSHPASS=false
