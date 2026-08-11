@@ -582,12 +582,62 @@ fi
 step "Firefox"
 #########################################################################
 if [ "$DO_FIREFOX" = true ]; then
-    if command -v firefox >/dev/null 2>&1; then
-        print_green "  firefox already installed"
+    # Test by RUNNING it, never with 'command -v'.
+    #
+    # On arm64 Ubuntu 22.04 the 'firefox' apt package is only a transitional
+    # shim to the snap -- a ~2.4 kB shell script. So the binary exists whether
+    # or not a working browser does, and the old 'command -v firefox' guard
+    # passed on that shim: the warning never fired and every Jetson finished
+    # provisioning exit 0 with a browser that could not start.
+    #
+    # And it can never start. The L4T Tegra kernel is built WITHOUT AppArmor,
+    # which snapd requires, so snap-confine aborts on every snap with
+    # "required permitted capability cap_dac_override not found in current
+    # capabilities". Confusingly 'getcap' shows the capability present on the
+    # binary and the rootfs is not nosuid, so the file looks correct and
+    # reinstalling snapd or re-running setcap changes nothing. Installing the
+    # snap is therefore not a fallback -- it is the failure.
+    #
+    # Mozilla publishes real arm64 debs, which need no snapd and no AppArmor.
+    firefox_works() { firefox --version 2>/dev/null | grep -qi "^Mozilla Firefox"; }
+
+    if firefox_works; then
+        print_green "  firefox already installed and working ($(firefox --version 2>/dev/null))"
     else
-        apt_try firefox
-        command -v firefox >/dev/null 2>&1 || \
-            warn "Firefox not installed. On Jetson/arm64 the apt 'firefox' package is a snap shim; try: sudo snap install firefox"
+        print_italic "  installing Firefox from Mozilla's APT repo (real arm64 deb, not the snap)"
+        sudo install -d -m 0755 /etc/apt/keyrings
+        if sudo curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+                     -o /etc/apt/keyrings/packages.mozilla.org.asc; then
+            echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+                | sudo tee /etc/apt/sources.list.d/mozilla.list >/dev/null
+            # Ubuntu's shim carries an epoch (1:1snap1-0ubuntu2) that outranks
+            # Mozilla's bare version string, so apt prefers the shim and then
+            # reads the real browser as a *downgrade*. Both the pin and
+            # --allow-downgrades below are required; either alone is not enough.
+            printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+                | sudo tee /etc/apt/preferences.d/mozilla >/dev/null
+            apt_get update >/dev/null 2>&1 || true
+            apt_get install -y --allow-downgrades firefox >/dev/null 2>&1 || \
+                warn "Firefox install from packages.mozilla.org failed."
+        else
+            warn "Could not fetch Mozilla's APT signing key; Firefox not installed."
+        fi
+
+        if firefox_works; then
+            print_green "  installed $(firefox --version 2>/dev/null)"
+            # Remove the snap if one is present. It cannot run on this kernel,
+            # and leaving it means a future PATH lookup can resolve to it.
+            # 'snap remove' still works even though snaps cannot be launched.
+            if snap list firefox >/dev/null 2>&1; then
+                sudo snap remove --purge firefox >/dev/null 2>&1 && \
+                    print_green "  removed the inert firefox snap"
+            fi
+        else
+            warn "Firefox still does not run. The apt 'firefox' package on arm64 is only a
+       snap shim, and snaps cannot run on the L4T kernel (no AppArmor module).
+       Do NOT 'snap install firefox' -- see TROUBLESHOOTING.md for the manual
+       Mozilla-deb steps."
+        fi
     fi
 else
     print_italic "  skipped (--skip-firefox)"
