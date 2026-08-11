@@ -1391,6 +1391,97 @@ EOF_RRSCRIPT
     sudo chmod +x /usr/sbin/roverrobotics
     print_green "  wrote /usr/sbin/roverrobotics ($ROBOT_TYPE)"
 
+    # --- BNO055 UART reset helper --------------------------------------
+    # Without this, a restart loop can OUTLIVE the fault that started it.
+    #
+    # Observed on a rover that booted with no CAN adapter: the driver fataled,
+    # on_exit=Shutdown() tore the launch down, and that killed the bno055 node
+    # mid-transaction -- leaving unread bytes in the FT232H bridge. Every
+    # subsequent start then read those stale bytes, died with "Payload length
+    # mismatch detected: received=1, awaited=45" (exit 1), and tore the launch
+    # down again. After ~150 restarts, plugging the CAN adapter in did NOT
+    # recover the rover: the loop had stopped being about CAN and was
+    # sustaining itself on the desynced UART. It needed a human with SSH.
+    #
+    # Power-cycling the bridge clears the buffer, so doing it before every
+    # start makes the loop self-limiting. Matched on VID:PID rather than the
+    # product string, for the same reason enablecan is.
+    sudo tee /usr/local/sbin/reset_bno055_usb.sh >/dev/null <<'EOF_IMURESET'
+#!/bin/bash
+# Clear a desynced BNO055 UART before the driver launch starts.
+#
+# Two rungs, cheapest first. Always exits 0: a machine with no BNO055 fitted,
+# or a flush that fails, must still let the driver start.
+#
+# Rung 1 -- FLUSH (the normal path). Discards stale bytes left in the bridge by
+# a node killed mid-transaction. ftdi_sio turns TCFLSH into an FTDI
+# buffer-purge, so this clears the chip's own FIFO, not just the kernel's.
+#
+# Rung 2 -- POWER-CYCLE, only when the device node is missing entirely.
+# Deliberately NOT the default: toggling 'authorized' also cuts power to the
+# BNO055, and the sensor needs ~1s to reboot. Doing it before every start made
+# the node open the port before the sensor could answer and die with
+# "Unexpected length of READ-request response: 0" -- which turned a HEALTHY
+# rover into a restart loop. Measured, not theorised: it was tried that way
+# first. Only reach for it when there is nothing to lose.
+
+PORT=/dev/bno055
+
+if [ -e "$PORT" ]; then
+  python3 - "$PORT" <<'PY' 2>/dev/null || true
+import os, sys, termios, time
+try:
+    fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+except OSError:
+    sys.exit(0)
+try:
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    time.sleep(0.2)
+    try:                                  # drain whatever streamed meanwhile
+        while os.read(fd, 4096):
+            pass
+    except OSError:
+        pass
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    print("reset_bno055_usb: flushed %s" % sys.argv[1])
+finally:
+    os.close(fd)
+PY
+  exit 0
+fi
+
+# No device node: the bridge is missing or wedged. Now a power-cycle is worth
+# it, with enough settle time for the sensor to boot before the node opens it.
+for idv in /sys/bus/usb/devices/*/idVendor; do
+  dev="${idv%/idVendor}"
+  [ "$(cat "$idv" 2>/dev/null)" = "0403" ] || continue
+  [ "$(cat "$dev/idProduct" 2>/dev/null)" = "6014" ] || continue
+  auth="$dev/authorized"
+  if [ -w "$auth" ]; then
+    echo 0 > "$auth"; sleep 1
+    echo 1 > "$auth"
+    echo "reset_bno055_usb: power-cycled FT232H at $(basename "$dev")"
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5
+    sleep 2   # BNO055 POR takes ~650ms; give it margin before the node opens.
+  fi
+done
+exit 0
+EOF_IMURESET
+    sudo chmod +x /usr/local/sbin/reset_bno055_usb.sh
+    print_green "  wrote /usr/local/sbin/reset_bno055_usb.sh"
+
+    # The unit runs 'sudo -n' as $RUN_USER. Scoped to this one script.
+    echo "$RUN_USER ALL=(root) NOPASSWD: /usr/local/sbin/reset_bno055_usb.sh" \
+        | sudo tee /etc/sudoers.d/rover-bno055 >/dev/null
+    sudo chmod 0440 /etc/sudoers.d/rover-bno055
+    if sudo visudo -cf /etc/sudoers.d/rover-bno055 >/dev/null 2>&1; then
+        print_green "  wrote /etc/sudoers.d/rover-bno055 (NOPASSWD for the reset helper)"
+    else
+        sudo rm -f /etc/sudoers.d/rover-bno055
+        warn "sudoers drop-in failed validation and was removed; the BNO055 UART reset will
+       be skipped. The driver still starts -- ExecStartPre is prefixed '-'."
+    fi
+
     sudo tee /etc/systemd/system/roverrobotics.service >/dev/null <<EOF_RRSVC
 [Unit]
 Description=Rover Robotics $ROBOT_TYPE driver
@@ -1411,10 +1502,20 @@ Environment=HOME=$RUN_HOME
 # implementations is unsupported in ROS 2: the driver and the camera node
 # would each come up fine yet never see each other's topics.
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# Power-cycle the BNO055's FT232H bridge before every start, so a UART left
+# desynced by a previous teardown cannot sustain the restart loop forever.
+# See /usr/local/sbin/reset_bno055_usb.sh for the full failure mode.
+#
+# The leading '-' is deliberate and load-bearing: without it, a missing
+# sudoers rule or a wedged USB subsystem would make ExecStartPre fail and the
+# driver would never start at all. Failing to reset the IMU must never be
+# worse than not trying -- this unit is what drives the robot.
+ExecStartPre=-/usr/bin/sudo -n /usr/local/sbin/reset_bno055_usb.sh
 ExecStart=/bin/bash /usr/sbin/roverrobotics
 # 'always', not 'on-failure': a driver that exits 0 has still stopped driving
 # the robot, so treat a clean exit as something to recover from too.
 Restart=always
+# ExecStartPre adds ~3s of USB reset to every attempt, so a cycle is ~8s.
 RestartSec=5
 
 [Install]
