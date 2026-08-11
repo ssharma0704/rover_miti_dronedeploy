@@ -66,9 +66,12 @@ Reattach any time with `--follow`.
 10. Clones `roverrobotics_ros2`, `web_video_server` (private), and `bno055`
 11. **RealSense** — librealsense SDK with CUDA, `realsense-ros`,
     `reset_realsense_usb.sh`, `rover-realsense.service`
-12. udev rules + `dialout` group
+12. udev rules + `dialout` group — includes **`55-roverrobotics.rules`**, which
+    binds the BNO055's FT232H bridge (`0403:6014`) to `/dev/bno055` so the IMU
+    does not depend on `ttyUSB*` enumeration order
 13. `rosdep`
-14. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`)
+14. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`), which
+    also brings up the **BNO055 IMU** when `accessories.yaml` enables it
 15. `colcon build`
 
 Everything is **idempotent** — a re-run skips what's already installed.
