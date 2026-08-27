@@ -66,7 +66,9 @@ Reattach any time with `--follow`.
    timer, which restores the link if it drops
 10. Clones `roverrobotics_ros2`, `web_video_server` (private), and `bno055`
 11. **RealSense** — librealsense SDK with CUDA, `realsense-ros`,
-    `reset_realsense_usb.sh`, `rover-realsense.service`
+    `reset_realsense_usb.sh`, `rover-realsense.service`,
+    **`realsense-watchdog`** + `realsense-watchdog.timer` (checks that frames are
+    actually arriving, since the node can sit `active` publishing nothing)
 12. udev rules + `dialout` group — includes **`55-roverrobotics.rules`**, which
     binds the BNO055's FT232H bridge (`0403:6014`) to `/dev/bno055` so the IMU
     does not depend on `ttyUSB*` enumeration order

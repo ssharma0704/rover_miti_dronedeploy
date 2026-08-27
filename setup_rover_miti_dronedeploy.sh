@@ -754,6 +754,19 @@ if ! grep -Fq "$RMW_LINE" "$RUN_HOME/.bashrc" 2>/dev/null; then
     print_green "  pinned RMW_IMPLEMENTATION=rmw_cyclonedds_cpp in ~/.bashrc"
 fi
 
+# .bashrc is not enough on its own. Ubuntu's copy returns early for
+# non-interactive shells, so 'ssh rover@host ros2 ...' and any script get the
+# FastDDS default while an interactive login gets CycloneDDS. ros2cli keys its
+# daemon on (domain, rmw), so the two spawn rival daemons and 'ros2 topic list'
+# starts reporting nothing while the robot is fine. /etc/environment is read by
+# PAM for every session, interactive or not.
+for kv in "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" "ROS_DOMAIN_ID=0"; do
+    if ! grep -Fq "$kv" /etc/environment 2>/dev/null; then
+        echo "$kv" | sudo tee -a /etc/environment >/dev/null
+        print_green "  pinned $kv in /etc/environment"
+    fi
+done
+
 #########################################################################
 step "ROS 2 $ROS_DISTRO_SEL packages"
 #########################################################################
@@ -1272,6 +1285,12 @@ Group=$RUN_GROUP
 WorkingDirectory=$RUN_HOME
 Environment=HOME=$RUN_HOME
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# Let the camera settle before the node opens it. Started straight after boot
+# the node grabs a D435 that is not ready, logs "RealSense Node Is Up!", and
+# then publishes nothing at all -- unit active, NRestarts=0, no error anywhere.
+# Measured on 10.1.10.220: without this the camera was silent until a restart;
+# with it, topics are live ~45s after boot on every reboot tested.
+ExecStartPre=/bin/sleep 20
 ExecStartPre=/usr/bin/sudo -n /usr/local/sbin/reset_realsense_usb.sh
 ExecStart=/usr/bin/env bash -lc '\\
   source /opt/ros/$ROS_DISTRO_SEL/setup.bash; \\
@@ -1297,6 +1316,108 @@ EOF_RSSVC
     sudo systemctl daemon-reload
     sudo systemctl enable rover-realsense.service >/dev/null 2>&1 || \
         warn "Could not enable rover-realsense.service"
+
+    # --- realsense watchdog --------------------------------------------
+    # The camera node can sit alive and publish nothing, which systemd cannot
+    # see: the unit reads active with NRestarts=0 and Restart=always never
+    # fires. can-watchdog exists for the same reason on the CAN side. Judge the
+    # topic, not the unit.
+    sudo tee /usr/local/sbin/realsense-probe >/dev/null <<'EOF_RSPROBE'
+#!/usr/bin/env python3
+# Exit 0 if a frame arrives on the topic within the timeout, else 1.
+# Subscribes directly: 'ros2 topic echo' resolves types via the ros2cli daemon,
+# and a wedged daemon reports no frames while the camera streams at 28 Hz.
+import sys, time
+import rclpy
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+
+topic   = sys.argv[1] if len(sys.argv) > 1 else '/camera/camera/color/image_raw'
+timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 15.0
+
+rclpy.init(args=None)
+node = rclpy.create_node('realsense_probe')
+seen = []
+# BEST_EFFORT: a RELIABLE subscriber never matches an image publisher.
+node.create_subscription(Image, topic, lambda _m: seen.append(1),
+                         qos_profile_sensor_data)
+
+deadline = time.monotonic() + timeout
+while rclpy.ok() and not seen and time.monotonic() < deadline:
+    rclpy.spin_once(node, timeout_sec=0.2)
+
+node.destroy_node()
+rclpy.shutdown()
+sys.exit(0 if seen else 1)
+EOF_RSPROBE
+    sudo chmod +x /usr/local/sbin/realsense-probe
+
+    sudo tee /usr/sbin/realsense-watchdog >/dev/null <<'EOF_RSWD'
+#!/bin/bash
+# Restart rover-realsense.service when a RealSense is on the bus but no frames
+# are arriving. Run from realsense-watchdog.timer.
+
+TOPIC=/camera/camera/color/image_raw
+UNIT=rover-realsense.service
+PROBE=/usr/local/sbin/realsense-probe
+SETTLE=15
+WAIT=6
+
+# No camera fitted: the unit is meant to idle, not restart forever.
+lsusb | grep -qiE '8086:0b[0-9a-f]{2}' || exit 0
+systemctl is-active --quiet "$UNIT" || exit 0
+
+# A start still coming up needs time to open both sensors; do not judge it yet.
+since=$(systemctl show "$UNIT" -p ActiveEnterTimestampMonotonic --value)
+now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+[ -n "$since" ] && [ "$since" -gt 0 ] || exit 0
+[ $(( (now - since) / 1000000 )) -ge "$SETTLE" ] || exit 0
+
+export HOME=RUN_HOME_PLACEHOLDER
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_DOMAIN_ID=0
+source /opt/ros/ROS_DISTRO_PLACEHOLDER/setup.bash      >/dev/null 2>&1
+source WORKSPACE_PLACEHOLDER/install/setup.bash        >/dev/null 2>&1
+
+"$PROBE" "$TOPIC" "$WAIT" && exit 0
+sleep 3                                    # absorb a one-off miss
+"$PROBE" "$TOPIC" "$WAIT" && exit 0
+
+echo "realsense-watchdog: no frame on $TOPIC across two ${WAIT}s probes; restarting $UNIT"
+systemctl restart "$UNIT"
+EOF_RSWD
+    sudo sed -i "s|RUN_HOME_PLACEHOLDER|$RUN_HOME|; s|ROS_DISTRO_PLACEHOLDER|$ROS_DISTRO_SEL|; s|WORKSPACE_PLACEHOLDER|$WORKSPACE_DIR|" /usr/sbin/realsense-watchdog
+    sudo chmod +x /usr/sbin/realsense-watchdog
+
+    sudo tee /etc/systemd/system/realsense-watchdog.service >/dev/null <<'EOF_RSWDSVC'
+[Unit]
+Description=Restart rover-realsense.service if the camera has stopped publishing
+After=rover-realsense.service
+# Not Requires=/Wants=: must still run when the camera unit is stuck.
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+ExecStart=/usr/sbin/realsense-watchdog
+EOF_RSWDSVC
+
+    sudo tee /etc/systemd/system/realsense-watchdog.timer >/dev/null <<'EOF_RSWDTMR'
+[Unit]
+Description=Periodically verify the RealSense is publishing frames
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=20
+AccuracySec=1
+Unit=realsense-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF_RSWDTMR
+    print_green "  wrote realsense-watchdog.service + .timer"
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now realsense-watchdog.timer >/dev/null 2>&1 || \
+        warn "Could not enable realsense-watchdog.timer"
 
     # The SDK build asks for the camera to be unplugged, and nothing ever asked
     # for it back -- so a run could finish "successfully" with no camera

@@ -243,6 +243,62 @@ Loud beats invisible — but it does mean the IMU is now load-bearing for drivin
 
 ---
 
+### The camera publishes nothing, but every indicator says it is fine
+
+`systemctl is-active rover-realsense.service` says `active`, `NRestarts=0`, the
+node logged `RealSense Node Is Up!`, the topics are listed — and no frames ever
+arrive. Nothing in the journal is an error.
+
+systemd cannot see this. The node stays alive while publishing nothing, so the
+main process never exits and `Restart=always` never fires. **Judge the topic,
+not the unit:**
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw     # the only answer that counts
+```
+
+Do **not** use `ros2 topic list` to decide whether the camera is alive — see the
+daemon entry below; it reports nothing while the camera streams at 28 Hz.
+
+Two things address this:
+
+* `ExecStartPre=/bin/sleep 20` in `rover-realsense.service` is the actual fix.
+  Started immediately after boot the node opens a D435 that is not ready yet and
+  never recovers. With the delay, topics are live ~45s after boot.
+* `realsense-watchdog.timer` is the backstop, checking every 20s that frames are
+  actually arriving and restarting the unit if not. It should normally never
+  fire; if it is firing every boot, the delay above is missing or too short.
+
+`systemctl restart rover-realsense` always clears it by hand.
+
+### `ros2 topic list` shows nothing, or dies with `!rclpy.ok()`
+
+```
+xmlrpc.client.Fault: <Fault 1: "<class 'RuntimeError'>:!rclpy.ok()">
+```
+
+The ros2 CLI daemon has wedged. The robot is almost certainly fine — confirm
+with `ros2 topic hz` on a known topic, which does not use the daemon.
+
+```bash
+pkill -KILL -f '[r]os2cli'      # SIGTERM does not shift a wedged one
+```
+
+The bracket around the first letter matters: `pkill -f ros2cli` run over SSH
+matches its own command line and kills your shell instead.
+
+A second cause is an RMW split. `~/.bashrc` exports `RMW_IMPLEMENTATION` but
+Ubuntu's `.bashrc` returns early for non-interactive shells, so scripts and
+`ssh host 'ros2 ...'` get the FastDDS default while an interactive login gets
+CycloneDDS. Each spawns its own daemon and they disagree about what exists. The
+provisioner now also writes both `RMW_IMPLEMENTATION` and `ROS_DOMAIN_ID` to
+`/etc/environment`, which PAM applies to every session. Check with:
+
+```bash
+ssh rover@<ip> 'echo $RMW_IMPLEMENTATION'        # must not be empty
+ps -eo pid,stat,cmd | grep ros2cli.daemon        # shows the rmw it started with
+```
+
 ### `rover-realsense.service` starts then immediately fails
 
 Two prerequisites, both easy to miss because the unit file alone doesn't reveal
