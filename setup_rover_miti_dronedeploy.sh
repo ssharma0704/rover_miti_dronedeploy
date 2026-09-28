@@ -23,7 +23,8 @@ ROVER_REPO_BRANCH=""
 WVS_REPO_NAME="web_video_server"
 WVS_REPO_BRANCH="ros2"
 
-IMU_REPO="https://github.com/flynneva/bno055.git"
+IMU_REPO="https://github.com/ssharma0704/bno055.git"
+IMU_BRANCH="fix-startup-race"   # flynneva/bno055 + startup-race fix (upstream PR pending)
 REALSENSE_ROS_REPO="https://github.com/IntelRealSense/realsense-ros.git"
 REALSENSE_ROS_BRANCH="ros2-master"
 
@@ -760,12 +761,48 @@ fi
 # daemon on (domain, rmw), so the two spawn rival daemons and 'ros2 topic list'
 # starts reporting nothing while the robot is fine. /etc/environment is read by
 # PAM for every session, interactive or not.
-for kv in "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" "ROS_DOMAIN_ID=0"; do
+for kv in "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" "ROS_DOMAIN_ID=0" \
+          "ROS_LOCALHOST_ONLY=1"; do
     if ! grep -Fq "$kv" /etc/environment 2>/dev/null; then
         echo "$kv" | sudo tee -a /etc/environment >/dev/null
         print_green "  pinned $kv in /etc/environment"
     fi
 done
+
+#########################################################################
+step "Loopback multicast (lo-multicast.service)"
+#########################################################################
+# CycloneDDS needs MULTICAST on lo to discover peers when eno1 is down
+sudo tee /etc/systemd/system/lo-multicast.service >/dev/null <<'EOF_LOMCAST'
+[Unit]
+Description=Enable multicast on loopback (required for CycloneDDS SPDP discovery on lo)
+DefaultDependencies=no
+After=sysinit.target
+Before=network-pre.target
+Wants=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip link set lo multicast on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF_LOMCAST
+print_green "  wrote /etc/systemd/system/lo-multicast.service"
+
+sudo systemctl daemon-reload
+sudo systemctl enable lo-multicast.service >/dev/null 2>&1 || \
+    warn "Could not enable lo-multicast.service"
+if sudo systemctl start lo-multicast.service; then
+    if ip link show lo | grep -q MULTICAST; then
+        print_green "  lo is multicast-capable"
+    else
+        warn "lo-multicast.service ran but lo still has no MULTICAST flag"
+    fi
+else
+    warn "lo-multicast.service failed to start; CycloneDDS discovery over lo will not work"
+fi
 
 #########################################################################
 step "ROS 2 $ROS_DISTRO_SEL packages"
@@ -1156,9 +1193,15 @@ clone_or_update "$WVS_REPO_NAME" "$WVS_REPO_BRANCH" "$WORKSPACE_DIR/src/$WVS_REP
 if [ "$DO_IMU" = true ]; then
     print_italic "bno055 IMU"
     if [ -d "$WORKSPACE_DIR/src/bno055/.git" ]; then
-        print_green "  bno055 already present"
-    elif git clone "$IMU_REPO" "$WORKSPACE_DIR/src/bno055"; then
-        print_green "  cloned bno055"
+        git -C "$WORKSPACE_DIR/src/bno055" remote set-url origin "$IMU_REPO"
+        if git -C "$WORKSPACE_DIR/src/bno055" fetch -q origin "$IMU_BRANCH" && \
+           git -C "$WORKSPACE_DIR/src/bno055" checkout -q -B "$IMU_BRANCH" FETCH_HEAD; then
+            print_green "  bno055 updated to $IMU_BRANCH"
+        else
+            warn "bno055 could not switch to $IMU_BRANCH (local changes?). Left as-is."
+        fi
+    elif git clone -b "$IMU_BRANCH" "$IMU_REPO" "$WORKSPACE_DIR/src/bno055"; then
+        print_green "  cloned bno055 ($IMU_BRANCH)"
     else
         warn "Failed to clone the BNO055 repository"
     fi
@@ -1285,6 +1328,8 @@ Group=$RUN_GROUP
 WorkingDirectory=$RUN_HOME
 Environment=HOME=$RUN_HOME
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# Use the "lo" interface
+Environment=ROS_LOCALHOST_ONLY=1
 # Let the camera settle before the node opens it. Started straight after boot
 # the node grabs a D435 that is not ready, logs "RealSense Node Is Up!", and
 # then publishes nothing at all -- unit active, NRestarts=0, no error anywhere.
@@ -1313,6 +1358,16 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF_RSSVC
     print_green "  wrote /etc/systemd/system/rover-realsense.service"
+
+    # drop-in keeps the customer's unit file verbatim
+    sudo mkdir -p /etc/systemd/system/rover-realsense.service.d
+    sudo tee /etc/systemd/system/rover-realsense.service.d/10-lo-multicast.conf >/dev/null <<'EOF_RSDROPIN'
+[Unit]
+Wants=lo-multicast.service
+After=lo-multicast.service
+EOF_RSDROPIN
+    print_green "  wrote rover-realsense.service.d/10-lo-multicast.conf"
+
     sudo systemctl daemon-reload
     sudo systemctl enable rover-realsense.service >/dev/null 2>&1 || \
         warn "Could not enable rover-realsense.service"
@@ -1367,6 +1422,13 @@ WAIT=6
 lsusb | grep -qiE '8086:0b[0-9a-f]{2}' || exit 0
 systemctl is-active --quiet "$UNIT" || exit 0
 
+# no MULTICAST on lo blinds the probe; fix it and check next cycle
+if ! ip link show lo | grep -q MULTICAST; then
+    echo "realsense-watchdog: lo had no MULTICAST flag; enabling and skipping this cycle"
+    ip link set lo multicast on
+    exit 0
+fi
+
 # A start still coming up needs time to open both sensors; do not judge it yet.
 since=$(systemctl show "$UNIT" -p ActiveEnterTimestampMonotonic --value)
 now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
@@ -1376,6 +1438,11 @@ now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
 export HOME=RUN_HOME_PLACEHOLDER
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export ROS_DOMAIN_ID=0
+export ROS_LOCALHOST_ONLY=1
+# probe with the unit's own ROS env
+for kv in $(systemctl show "$UNIT" -p Environment --value); do
+    case "$kv" in ROS_*|RMW_*) export "$kv" ;; esac
+done
 source /opt/ros/ROS_DISTRO_PLACEHOLDER/setup.bash      >/dev/null 2>&1
 source WORKSPACE_PLACEHOLDER/install/setup.bash        >/dev/null 2>&1
 
@@ -1623,6 +1690,8 @@ Environment=HOME=$RUN_HOME
 # implementations is unsupported in ROS 2: the driver and the camera node
 # would each come up fine yet never see each other's topics.
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# Use the "lo" interface
+Environment=ROS_LOCALHOST_ONLY=1
 # Power-cycle the BNO055's FT232H bridge before every start, so a UART left
 # desynced by a previous teardown cannot sustain the restart loop forever.
 # See /usr/local/sbin/reset_bno055_usb.sh for the full failure mode.
@@ -1643,6 +1712,16 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF_RRSVC
     print_green "  wrote /etc/systemd/system/roverrobotics.service"
+
+    # drop-in keeps the customer's unit file verbatim
+    sudo mkdir -p /etc/systemd/system/roverrobotics.service.d
+    sudo tee /etc/systemd/system/roverrobotics.service.d/10-lo-multicast.conf >/dev/null <<'EOF_RRDROPIN'
+[Unit]
+Wants=lo-multicast.service
+After=lo-multicast.service
+EOF_RRDROPIN
+    print_green "  wrote roverrobotics.service.d/10-lo-multicast.conf"
+
     sudo systemctl daemon-reload
     sudo systemctl enable roverrobotics.service >/dev/null 2>&1 || \
         warn "Could not enable roverrobotics.service"
@@ -1723,6 +1802,7 @@ echo "  web_video_server   : $GITHUB_OWNER/$WVS_REPO_NAME @ $WVS_REPO_BRANCH"
 [ "$DO_REALSENSE" = true ] && echo "  realsense-ros      : $WORKSPACE_DIR/src/realsense-ros"
 echo ""
 print_bold "Services:"
+echo "  lo-multicast.service     -> ip link set lo multicast on"
 echo "  can.service              -> /usr/sbin/enablecan ($CAN_IFACE)"
 [ "$DO_AUTOSTART" = true ] && echo "  roverrobotics.service    -> ${ROBOT_TYPE}_teleop.launch.py"
 [ "$DO_REALSENSE" = true ] && echo "  rover-realsense.service  -> realsense2_camera + web_video_server"
@@ -1732,6 +1812,7 @@ echo "  1. Reboot so gs_usb, udev rules and the dialout group take effect:"
 echo "       sudo reboot"
 echo "  2. Check status:"
 echo "       systemctl status can.service roverrobotics.service rover-realsense.service"
+echo "     DDS is loopback-only: run ros2 on the rover, not from a laptop."
 echo "  3. Video stream (once rover-realsense.service is up):"
 echo "       http://<rover-ip>:8080/stream?topic=/camera/camera/color/image_raw&type=h264&bitrate=2000000"
 echo "       (drop &bitrate to use CRF mode; add &crf=<n> to tune quality)"

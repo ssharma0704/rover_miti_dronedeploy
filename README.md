@@ -65,6 +65,10 @@ Reattach any time with `--follow`.
    CAN-FD → classic fallback, link verification) and **`can-watchdog`** +
    timer, which restores the link if it drops
 10. Clones `roverrobotics_ros2`, `web_video_server` (private), and `bno055`
+    (`ssharma0704/bno055`, branch `fix-startup-race`: upstream plus a retry of
+    the serial connect and sensor setup, so the IMU no longer crash-loops the
+    stack right after boot or a USB reset; a re-run switches an existing clone
+    to it)
 11. **RealSense** — librealsense SDK with CUDA, `realsense-ros`,
     `reset_realsense_usb.sh`, `rover-realsense.service`,
     **`realsense-watchdog`** + `realsense-watchdog.timer` (checks that frames are
@@ -83,6 +87,9 @@ Reattach any time with `--follow`.
     (the JetPack 6 axis/button map; the non-`_jp6` file has the sticks and
     triggers on the wrong indices for this kernel)
 16. `colcon build`
+17. **`lo-multicast.service`** and `ROS_LOCALHOST_ONLY=1` for the driver,
+    camera and watchdog: the DroneDeploy ROS plugin is localhost-only, and
+    CycloneDDS cannot discover over `lo` without the MULTICAST flag
 
 Everything is **idempotent** — a re-run skips what's already installed.
 
@@ -257,6 +264,24 @@ Behaviour worth knowing about, most of it learned by running this on real hardwa
 sudo reboot          # for gs_usb, udev rules and the dialout group
 systemctl status can.service roverrobotics.service rover-realsense.service
 ```
+
+### VESC settings (once per robot, in VESC Tool)
+
+The provisioner cannot reach the motor controllers' own settings. On **every
+VESC** (connect over USB, or over CAN through one of them):
+
+1. Motor Settings → FOC → Hall Sensors → **Hall Interpolation ERPM = 50**
+   (default 500). At 500 the VESC reports about half the real wheel speed below
+   ~0.44 m/s on a MITI, so the robot drives too fast at low speed and odometry
+   comes up short (32% short at 0.2 m/s before the change).
+2. Enable **CAN status message 5** (tachometer + input voltage) alongside 1 and 4.
+3. **Write Motor Configuration** / **Write App Configuration** on each VESC.
+
+The MITI config in `roverrobotics_ros2` (feedforward, gains P 0.0002 /
+I 0.00002 / D 0.00002, `wheel_base` 0.60) is tuned for this setting. Do not
+combine Hall Interpolation 50 with the September release gains
+(P 0.0007 / D 0.00009): on a stand that oscillated with 46-61 A current swings.
+Below ~0.07 m/s the speed reading is still unreliable (too few hall edges).
 
 Video stream, once `rover-realsense.service` is up:
 
