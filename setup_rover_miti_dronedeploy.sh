@@ -1162,6 +1162,90 @@ sudo systemctl enable can.service >/dev/null 2>&1 || warn "Could not enable can.
 sudo systemctl enable --now can-watchdog.timer >/dev/null 2>&1 || \
     warn "Could not enable can-watchdog.timer"
 
+# Loopback self-test: tells a wedged USB-CAN adapter from a quiet bus.
+sudo tee /usr/sbin/can-selftest >/dev/null <<EOF_CANSELFTEST
+#!/bin/bash
+# Is the USB-CAN adapter itself working, or is the bus just quiet?
+# Usage: sudo can-selftest
+IFACE=$CAN_IFACE
+BITRATE=500000
+VID=1d50
+PID=606f
+
+if [ "\$(id -u)" -ne 0 ]; then echo "run me with sudo" >&2; exit 2; fi
+
+if ! lsusb 2>/dev/null | grep -qi "\$VID:\$PID"; then
+  echo "RESULT: no \$VID:\$PID adapter on the USB bus."
+  echo "        The module is unplugged, or the cable/port is dead."
+  exit 1
+fi
+
+if ! ip link show "\$IFACE" >/dev/null 2>&1; then
+  echo "RESULT: adapter is on USB but there is no '\$IFACE' interface."
+  echo "        The udev rename did not run. Check /etc/udev/rules.d/99-can-usb.rules,"
+  echo "        then unplug and replug the adapter."
+  exit 1
+fi
+
+# Remember what to put back.
+DRIVER_WAS=\$(systemctl is-active roverrobotics.service 2>/dev/null)
+restore() {
+  ip link set "\$IFACE" down 2>/dev/null
+  ip link set "\$IFACE" type can bitrate "\$BITRATE" loopback off 2>/dev/null
+  systemctl restart can.service >/dev/null 2>&1
+  [ "\$DRIVER_WAS" = "active" ] && systemctl start roverrobotics.service >/dev/null 2>&1
+}
+trap restore EXIT
+
+[ "\$DRIVER_WAS" = "active" ] && systemctl stop roverrobotics.service >/dev/null 2>&1
+sleep 1
+
+echo "Testing \$IFACE in loopback (no bus partner needed)..."
+ip link set "\$IFACE" down 2>/dev/null
+if ! ip link set "\$IFACE" type can bitrate "\$BITRATE" loopback on 2>/dev/null; then
+  echo "RESULT: could not put \$IFACE into loopback mode."
+  exit 1
+fi
+if ! ip link set "\$IFACE" up 2>/dev/null; then
+  echo "RESULT: \$IFACE would not come up even in loopback."
+  echo "        The adapter is not responding. Unplug and replug the USB-CAN module."
+  exit 1
+fi
+sleep 1
+
+OUT=\$(mktemp)
+timeout 5 candump -n 2 "\$IFACE" > "\$OUT" 2>/dev/null &
+DPID=\$!
+sleep 1
+for i in 1 2 3; do cansend "\$IFACE" 123#DEADBEEF 2>/dev/null; sleep 0.3; done
+wait \$DPID 2>/dev/null
+GOT=\$(wc -l < "\$OUT" 2>/dev/null)
+rm -f "\$OUT"
+
+echo
+if [ "\${GOT:-0}" -gt 0 ]; then
+  echo "RESULT: ADAPTER IS HEALTHY (looped back \$GOT frame(s))."
+  echo "        So a silent bus is NOT the adapter. Check, in this order:"
+  echo "          1. the rover is powered on and the e-stop is released"
+  echo "          2. the CAN cable between the adapter and the rover"
+  echo "          3. 120 ohm termination at both ends of the bus"
+  exit 0
+else
+  echo "RESULT: ADAPTER IS WEDGED. It cannot even receive its own frames."
+  echo "        This is the adapter, not the rover and not the wiring."
+  echo "        Unplug the USB-CAN module and plug it back in, then:"
+  echo "          sudo systemctl restart can.service"
+  echo
+  echo "        Some boards (notably canable.io CANable) wedge after a warm"
+  echo "        reboot and are not recoverable in software: not by usbreset,"
+  echo "        driver rebind, module reload, nor by cutting port power."
+  echo "        Only a physical replug clears it."
+  exit 1
+fi
+EOF_CANSELFTEST
+sudo chmod +x /usr/sbin/can-selftest
+print_green "  wrote /usr/sbin/can-selftest"
+
 if sudo systemctl restart can.service; then
     sleep 2
     if ip link show "$CAN_IFACE" >/dev/null 2>&1; then
@@ -1808,6 +1892,7 @@ echo ""
 print_bold "Services:"
 echo "  lo-multicast.service     -> ip link set lo multicast on"
 echo "  can.service              -> /usr/sbin/enablecan ($CAN_IFACE)"
+echo "  can-selftest             -> sudo can-selftest (adapter or bus?)"
 [ "$DO_AUTOSTART" = true ] && echo "  roverrobotics.service    -> ${ROBOT_TYPE}_teleop.launch.py"
 [ "$DO_REALSENSE" = true ] && echo "  rover-realsense.service  -> realsense2_camera + web_video_server"
 echo ""
