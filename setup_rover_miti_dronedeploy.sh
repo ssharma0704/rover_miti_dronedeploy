@@ -1707,6 +1707,10 @@ ExecStart=/bin/bash /usr/sbin/roverrobotics
 Restart=always
 # ExecStartPre adds ~3s of USB reset to every attempt, so a cycle is ~8s.
 RestartSec=5
+# SIGINT to ros2 launch only, so the driver runs its brake-on-exit
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

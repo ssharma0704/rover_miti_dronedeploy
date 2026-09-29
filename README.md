@@ -80,7 +80,9 @@ Reattach any time with `--follow`.
 14. **`reset_bno055_usb.sh`** + `/etc/sudoers.d/rover-bno055` — an
     `ExecStartPre` that flushes the IMU's UART before each driver start, so a
     restart loop cannot sustain itself on a desynced serial port
-15. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`), which
+15. **`roverrobotics.service`** autostart (`<robot>_teleop.launch.py`); it stops
+    gracefully (`KillMode=mixed`, `SIGINT`) so the driver brakes the motors on exit,
+    and it
     also brings up the **BNO055 IMU** when `accessories.yaml` enables it, and
     the **PS5 (DualSense) gamepad** — `miti_teleop.launch.py` includes
     `ps5_controller.launch.py`, which loads `ps5_controller_config_jp6.yaml`
