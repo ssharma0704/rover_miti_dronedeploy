@@ -63,7 +63,8 @@ Reattach any time with `--follow`.
 9. **`60-rover-can.rules`** — udev rule binding the USB-CAN adapter to a stable
    name by VID:PID, plus **`can.service`** + `/usr/sbin/enablecan` (USB reset,
    CAN-FD → classic fallback, link verification) and **`can-watchdog`** +
-   timer, which restores the link if it drops, and **`can-selftest`**
+   timer, which restores the link within 10 s if it drops or goes bus-off
+   (`gs_usb` cannot restart itself from bus-off), and **`can-selftest`**
    (`sudo can-selftest`), which tells a wedged adapter from a quiet bus
 10. Clones `roverrobotics_ros2`, `web_video_server` (private), and `bno055`
     (`ssharma0704/bno055`, branch `fix-startup-race`: upstream plus a retry of

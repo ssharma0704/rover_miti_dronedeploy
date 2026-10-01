@@ -1158,17 +1158,20 @@ sudo tee /usr/sbin/can-watchdog >/dev/null <<'EOF_CANWD'
 # IFACE is the udev-assigned stable name, not a kernel canN name -- see
 # /etc/udev/rules.d/60-rover-can.rules.
 #
-# Run from can-watchdog.timer every 30s.
+# Run from can-watchdog.timer every 10s.
 IFACE=rovercan
 
 state=$(ip -brief link show "$IFACE" 2>/dev/null | awk '{print $2}')
+# a bus-off interface still reports UP, and gs_usb cannot restart itself from it (no restart-ms)
+cstate=$(ip -details link show "$IFACE" 2>/dev/null | grep -o 'can state [A-Z-]*' | awk '{print $3}')
 
-if [ "$state" = "UP" ]; then
+if [ "$state" = "UP" ] && [ "$cstate" != "BUS-OFF" ]; then
     exit 0
 fi
+[ "$cstate" = "BUS-OFF" ] && state="UP but BUS-OFF"
 
 # Say whether the adapter is even plugged in. Without this the journal just
-# shows a restart every 30s with no indication whether the cable is out or the
+# shows a restart every 10s with no indication whether the cable is out or the
 # link merely dropped.
 if lsusb 2>/dev/null | grep -qi "1d50:606f"; then
     detail="adapter present on USB"
@@ -1201,7 +1204,7 @@ Description=Periodically verify the CAN link is up
 [Timer]
 # Give can.service a chance to bring the link up at boot before checking.
 OnBootSec=60
-OnUnitActiveSec=30
+OnUnitActiveSec=10
 AccuracySec=5
 Unit=can-watchdog.service
 
