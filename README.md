@@ -151,7 +151,7 @@ Two things that breakdown corrects:
     --reboot                  Reboot at the end on success (gs_usb, udev rules
                               and the dialout group need it)
     --skip-realsense          Skip RealSense entirely
-    --skip-librealsense       Skip only the ~45 min SDK build
+    --skip-librealsense       Skip only the SDK build (the longest step)
     --no-build                Skip the final colcon build
 ```
 

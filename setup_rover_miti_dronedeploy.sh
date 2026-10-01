@@ -94,7 +94,7 @@ Options:
                                 this. Skipped if the colcon build failed.
       --skip-realsense          Skip RealSense entirely (SDK + ROS wrapper + service)
       --skip-librealsense       Clone realsense-ros but do NOT rebuild the
-                                librealsense SDK (~45 min build)
+                                librealsense SDK (the longest step)
       --skip-jetpack            Skip nvidia-jetpack install
       --skip-firefox            Skip Firefox install
       --skip-imu                Skip the BNO055 IMU repo
@@ -152,8 +152,50 @@ print_bold()     { echo -e "${BOLD}${1}${ENDCOLOR}"; }
 print_italic()   { echo -e "${ITALICBLUE}${1}${ENDCOLOR}"; }
 print_boldblue() { echo -e "${BOLDBLUE}${1}${ENDCOLOR}"; }
 
+PROV_START=$SECONDS
+fmt_dur() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+
 STEP=0
-step() { STEP=$((STEP + 1)); echo ""; print_bold "===== [$STEP] ${1} ====="; }
+step() {
+    STEP=$((STEP + 1)); echo ""
+    print_bold "===== [$STEP] ${1} =====  ($(fmt_dur $((SECONDS - PROV_START))) elapsed)"
+}
+
+# A long step prints a line every minute with elapsed and remaining time, so a
+# tail -f of the log shows the run is alive even while the build is quiet.
+HEARTBEAT_PID=""
+heartbeat_start() {
+    local label="$1" est="$2" start=$SECONDS
+    (
+        while sleep 60; do
+            el=$((SECONDS - start))
+            if [ "$el" -le "$est" ]; then left="about $(fmt_dur $((est - el))) left"
+            else left="taking longer than usual, still working"; fi
+            echo "  ... $label: $(fmt_dur "$el") elapsed, $left"
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+heartbeat_stop() {
+    if [ -n "$HEARTBEAT_PID" ]; then kill "$HEARTBEAT_PID" 2>/dev/null || true; fi
+    HEARTBEAT_PID=""
+}
+
+# Parallel jobs for the librealsense build: one per core, at most one per 2 GB of
+# RAM so a small Jetson does not run out of memory, never fewer than Intel's 2.
+build_jobs() {
+    local cores mem_gb jobs
+    cores=$(nproc 2>/dev/null || echo 2)
+    mem_gb=$(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ -z "$mem_gb" ] || [ "$mem_gb" -le 0 ]; then
+        jobs=2
+    else
+        jobs=$cores
+        if [ $((mem_gb / 2)) -lt "$jobs" ]; then jobs=$((mem_gb / 2)); fi
+    fi
+    if [ "$jobs" -lt 2 ]; then jobs=2; fi
+    echo "$jobs"
+}
 
 # Collects non-fatal problems so the run ends with an honest summary instead of
 # a green "done" that hides a failed sub-step.
@@ -561,7 +603,14 @@ sudo_keepalive() {
 }
 sudo_keepalive &
 SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
+# wait_for_apt covers this script's own apt calls, but not the ones inside
+# Intel's librealsense script or NVIDIA's docker setup racing ours after
+# nvidia-jetpack. Make every apt on the machine wait up to 10 min for the lock,
+# for this run only.
+APT_LOCK_CONF=/etc/apt/apt.conf.d/90rover-provision-lock-wait
+echo 'DPkg::Lock::Timeout "600";' | sudo tee "$APT_LOCK_CONF" >/dev/null || true
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true; heartbeat_stop; sudo -n rm -f "$APT_LOCK_CONF" 2>/dev/null || true' EXIT
 
 #########################################################################
 step "System package index + base utilities"
@@ -581,7 +630,9 @@ if [ "$DO_JETPACK" = true ]; then
     if dpkg -s nvidia-jetpack >/dev/null 2>&1; then
         print_green "  nvidia-jetpack already installed"
     elif apt-cache show nvidia-jetpack >/dev/null 2>&1; then
+        heartbeat_start "installing nvidia-jetpack" 1200
         apt_try nvidia-jetpack
+        heartbeat_stop
     else
         warn "nvidia-jetpack not available from apt (not a Jetson, or the L4T apt source is missing). Skipped."
     fi
@@ -603,7 +654,9 @@ else
     print_italic "  nvcc not found -> installing CUDA development packages"
     # nvidia-cuda-dev only: on a Jetson, JetPack already supplies the CUDA
     # runtime, and pulling nvidia-cuda-toolkit as well can fight with it.
+    heartbeat_start "installing nvidia-cuda-dev" 300
     apt_try nvidia-cuda-dev
+    heartbeat_stop
     if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
         CUDA_OK=true
         print_green "  CUDA installed"
@@ -1301,7 +1354,7 @@ if [ "$DO_REALSENSE" = true ]; then
     # --- librealsense SDK (built with CUDA when available) --------------
     if [ "$DO_LIBREALSENSE_BUILD" = true ]; then
         if command -v realsense-viewer >/dev/null 2>&1 && \
-           ! confirm "  librealsense already appears installed. Rebuild it (~45 min)?" no; then
+           ! confirm "  librealsense already appears installed. Rebuild it (the longest step)?" no; then
             print_green "  keeping the existing librealsense install"
         else
             print_yellow "  Make sure the RealSense camera is NOT plugged in during the SDK build."
@@ -1337,11 +1390,21 @@ if [ "$DO_REALSENSE" = true ]; then
        upstream may have changed. The build will likely abort on EOF."
             fi
 
+            RS_JOBS=$(build_jobs)
+            sed -i "s|^make -j[0-9]*\$|make -j$RS_JOBS|" libuvc_installation.sh
+            if ! grep -q "^make -j$RS_JOBS\$" libuvc_installation.sh; then
+                warn "could not set the librealsense build job count; upstream may have changed"
+            fi
+            RS_EST=$(( 2700 * 2 / RS_JOBS )); if [ "$RS_EST" -lt 600 ]; then RS_EST=600; fi
+
             chmod +x ./libuvc_installation.sh
-            print_italic "  building librealsense (this can take ~45 minutes)..."
+            print_italic "  building librealsense with $RS_JOBS parallel jobs ($(nproc) cores, $(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo) GB RAM), usually about $(( RS_EST / 60 )) min..."
+            heartbeat_start "building librealsense" "$RS_EST"
             if ./libuvc_installation.sh; then
+                heartbeat_stop
                 print_green "  librealsense installed. You can plug the D435 back in."
             else
+                heartbeat_stop
                 warn "librealsense build failed. Verify with: realsense-viewer"
             fi
             cd "$WORKSPACE_DIR/src"
@@ -1851,7 +1914,9 @@ if [ "$DO_BUILD" = true ]; then
     set -u
 
     print_italic "  colcon build (this will take a while)..."
+    heartbeat_start "building the workspace" 900
     if colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release; then
+        heartbeat_stop
         BUILD_OK=true
         print_green "  build succeeded"
 
@@ -1861,6 +1926,7 @@ if [ "$DO_BUILD" = true ]; then
             print_green "  added workspace sourcing to ~/.bashrc"
         fi
     else
+        heartbeat_stop
         warn "colcon build FAILED. Inspect $WORKSPACE_DIR/log/latest_build/ for details."
     fi
 else
